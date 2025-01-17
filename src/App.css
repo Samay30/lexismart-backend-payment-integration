@@ -1,0 +1,257 @@
+/* App.css */
+/* Import Fonts */
+@import url('https://fonts.googleapis.com/css2?family=OpenDyslexic&family=Roboto:wght@400;500;700&family=Poppins:wght@500;600&display=swap');
+
+:root {
+  --background-color: #f6ede3; /* Softer, lighter background for better readability */
+  --primary-color: #5c91d9; /* Calming blue for primary elements */
+  --secondary-color: #7eb3e5; /* Lighter blue for hover and accents */
+  --text-color: #2e2e2e; /* Softer dark gray for text */
+  --input-background: #FFFBEA;
+  --button-text-color: white;
+  --card-background: white;
+  --shadow-color: rgba(0, 0, 0, 0.1);
+  --border-radius: 12px; /* Slightly more rounded corners for a sleeker look */
+  --disabled-color: #c3c9d5;
+  --highlight-color: #ffd35a; /* Subtle highlight color for feedback */
+}
+
+/* Apply OpenDyslexic font globally */
+body {
+  font-family: 'OpenDyslexic', sans-serif;
+  background-color: var(--background-color);
+  color: var(--text-color);
+  margin: 0;
+  padding: 0;
+  line-height: 1.8; /* Increased line-height for better readability */
+  overflow-x: hidden; /* Prevent horizontal scroll */
+}
+
+h1, h2 {
+  font-family: 'OpenDyslexic', sans-serif;
+  color: var(--text-color);
+}
+
+.App {
+  max-width: 850px;
+  margin: 40px auto;
+  padding: 20px;
+  background-color: var(--background-color);
+  text-align: center;
+}
+
+/* Typography Enhancements */
+h1 {
+  font-size: 3rem;
+  font-family: 'Poppins', sans-serif; /* Sleek font for titles */
+  font-weight: 600;
+  margin-bottom: 25px;
+}
+
+h2 {
+  font-size: 2.2rem;
+  margin-bottom: 15px;
+ 
+  padding-bottom: 8px;
+  
+  font-family: 'Poppins', sans-serif;
+  line-height: 1.4;
+}
+
+.section-title {
+  text-align: center;
+  margin-bottom: 20px;
+  color: var(--primary-color); /* Adding color to section titles for a more fun look */
+}
+
+/* Card Styles */
+.card {
+  background-color: var(--card-background);
+  padding: 30px;
+  border-radius: var(--border-radius);
+  box-shadow: 0px 8px 18px var(--shadow-color);
+  margin-bottom: 45px;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0px 10px 25px rgba(0, 0, 0, 0.15);
+}
+
+/* Textarea and File Input Styles */
+textarea, input[type="file"] {
+  width: 100%;
+  padding: 15px;
+  margin: 15px 0;
+  font-size: 1rem;
+  border: 1px solid #ccc;
+  border-radius: var(--border-radius);
+  background-color: var(--input-background);
+  box-shadow: 0px 2px 6px var(--shadow-color);
+  transition: border-color 0.3s ease;
+  font-family: 'OpenDyslexic', sans-serif; /* Apply OpenDyslexic font */
+}
+
+textarea:focus, input[type="file"]:focus {
+  border-color: var(--primary-color);
+  outline: none;
+  height: 120px; 
+}
+
+/* Button Styles */
+button {
+  padding: 14px 28px;
+  background-color: var(--primary-color);
+  color: var(--button-text-color);
+  border: none;
+  border-radius: var(--border-radius);
+  font-size: 1rem;
+  font-family: 'Poppins', sans-serif;
+  cursor: pointer;
+  margin: 15px;
+  box-shadow: 0px 6px 12px var(--shadow-color);
+  transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+button:hover {
+  background-color: var(--secondary-color);
+  transform: translateY(-3px);
+}
+
+button:disabled {
+  background-color: var(--disabled-color);
+  cursor: not-allowed;
+}
+
+/* Custom File Upload */
+.custom-file-upload {
+  padding: 14px 28px;
+  background-color: var(--primary-color);
+  color: var(--button-text-color);
+  border: none;
+  border-radius: var(--border-radius);
+  font-size: 1rem;
+  cursor: pointer;
+  margin: 65px;
+  box-shadow: 0px 6px 12px var(--shadow-color);
+  transition: background-color 0.3s ease, transform 0.2s ease;
+  margin-top: 200px;
+}
+
+.custom-file-upload:hover {
+  background-color: var(--secondary-color);
+  transform: translateY(-3px);
+}
+
+.custom-file-upload input[type="file"] {
+  display: none;
+}
+
+.flex-container {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+}
+
+/* Highlighting for Dyslexic-friendly Features */
+.highlighted-text {
+  font-size: 2.2rem; /* Increased text size to match h2 */
+  line-height: 2.5; /* Increased line spacing for better readability */
+  text-align: left; /* Align text to the left for easier reading */
+  margin-top: 20px;
+}
+
+.highlighted-text span.highlight {
+  background-color: var(--highlight-color); /* Softer highlight color for improved readability */
+  padding: 0 3px;
+}
+
+/* Feedback messages */
+.feedback {
+  font-weight: bold;
+  font-size: 1.2em;
+  margin-top: 15px;
+  color: var(--primary-color);
+}
+
+/* Input fields and question/answer fields */
+.input-field {
+  padding: 10px 15px;
+  margin: 10px 0;
+  border: 1px solid #ccc;
+  border-radius: var(--border-radius);
+  background-color: var(--input-background);
+  box-shadow: 0px 2px 6px var(--shadow-color);
+  font-family: 'OpenDyslexic', sans-serif; /* Apply OpenDyslexic font */
+  font-size: 1rem;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.input-field:focus {
+  border-color: var(--primary-color);
+  outline: none;
+  box-shadow: 0px 0px 5px var(--primary-color);
+}
+
+/* Specific styles for Question and Answer inputs */
+form input#question,
+form input#answer {
+  width: 100%;
+  padding: 12px 20px;
+  margin: 10px 0 20px 0;
+  box-sizing: border-box;
+  border: 2px solid #ccc;
+  border-radius: var(--border-radius);
+  background-color: var(--input-background);
+  font-family: 'OpenDyslexic', sans-serif;
+  font-size: 1rem;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+form input#question:focus,
+form input#answer:focus {
+  border-color: var(--primary-color);
+  box-shadow: 0px 0px 5px var(--primary-color);
+}
+
+/* Correct and Incorrect answer feedback */
+.correct {
+  background-color: lightgreen;
+  padding: 5px;
+}
+
+.incorrect {
+  background-color: lightcoral;
+  padding: 5px;
+}
+
+/* Media Queries for Responsiveness */
+@media (max-width: 768px) {
+  .flex-container {
+    flex-direction: column;
+  }
+  
+  .custom-file-upload {
+    margin-top: 20px;
+  }
+}
+label {
+  font-family: 'OpenDyslexic', sans-serif;
+  font-weight: bold;
+  font-size: 26px;
+  color: var(--text-color); /* Ensures label text color matches the overall text color */
+  display: block; /* Makes labels occupy the full width, improving form layout */
+  margin-bottom: 8px; /* Adds spacing below labels for better readability */
+}
+
+/* Optional: Specific Class for Labels */
+.form-label {
+  font-family: 'OpenDyslexic', sans-serif;
+  font-weight: bold;
+  font-size: 26px;
+  color: var(--text-color); /* Consistent text color */
+  display: block; /* Full-width display for better form alignment */
+  margin-bottom: 8px; /* Spacing below the label */
+}
