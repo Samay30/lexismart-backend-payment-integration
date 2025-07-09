@@ -8,8 +8,6 @@ textstat
 datasets
 networkx
 dotenv
-os
-logging
 json
 rouge-score
 spacy[cpu]==3.7.2
