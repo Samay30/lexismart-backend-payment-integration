@@ -1,4 +1,6 @@
-__pycache__/
-.env
-*.pyc
+*.env
 key.env
+.env
+__pycache__/
+*.pyc
+
