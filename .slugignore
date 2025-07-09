@@ -1,8 +1,0 @@
-*.log
-*.csv
-*.mp4
-node_modules
-.env
-venv
-tests/
-docs/
