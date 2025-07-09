@@ -3,4 +3,6 @@ key.env
 .env
 __pycache__/
 *.pyc
+*.mp3
 
+*.mp3
