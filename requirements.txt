@@ -6,3 +6,4 @@ requests
 spacy
 networkx
 gunicorn
+dotenv
