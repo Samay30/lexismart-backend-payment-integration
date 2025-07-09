@@ -7,3 +7,4 @@ spacy
 networkx
 gunicorn
 dotenv
+textstat
