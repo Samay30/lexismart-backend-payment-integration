@@ -222,7 +222,7 @@ def synthesize():
             },
             json={
                 "text": text,
-                "model_id": "eleven_monolingual_v1",
+                "model_id": "eleven_turbo_v2_5",
                 "voice_settings": {
                     "stability": 0.6,
                     "similarity_boost": 0.75
