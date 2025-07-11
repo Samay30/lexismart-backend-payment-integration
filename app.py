@@ -12,6 +12,8 @@ import openai
 import time
 import io
 import re
+from elevenlabs import ElevenLabs, VoiceSettings
+import tempfile
 
 load_dotenv()
 
@@ -133,6 +135,8 @@ def summarize():
 
 @app.route("/api/synthesize", methods=["POST"])
 def synthesize():
+    
+
     data = request.get_json()
     text = data.get("text", "").strip()
     voice_type = data.get("voice", DEFAULT_VOICE)
@@ -145,71 +149,48 @@ def synthesize():
         return jsonify({"error": "Server configuration error"}), 500
     
     try:
-        # Select voice
         voice_id = VOICES.get(voice_type, VOICES[DEFAULT_VOICE])
-        
-        # Truncate text to ElevenLabs limits
+
         if len(text) > MAX_TEXT_LENGTH:
             logger.warning(f"Truncating text from {len(text)} to {MAX_TEXT_LENGTH} characters")
             text = text[:MAX_TEXT_LENGTH]
         
-        logger.info(f"Synthesizing text with ElevenLabs using voice {voice_type} ({voice_id})")
-        
-        # Add encouraging prefix for short summaries
-        if len(text) < 100:
-            text = "Great job! " + text + " Keep up the good work!"
-        
-        # Voice style settings based on emotion
-        style_settings = {
-            "encouraging_female": {"stability": 0.35, "similarity_boost": 0.85, "style": 0.8},
-            "warm_male": {"stability": 0.4, "similarity_boost": 0.9, "style": 0.6},
-            "enthusiastic": {"stability": 0.25, "similarity_boost": 0.8, "style": 0.95},
-            "calm": {"stability": 0.5, "similarity_boost": 0.95, "style": 0.3}
-        }
-        style = style_settings.get(voice_type, style_settings[DEFAULT_VOICE])
-        
-        payload = {
-            "text": text,
-            "model_id": "eleven_turbo_v2",  # More expressive model
-            "voice_settings": {
-                "stability": style["stability"],
-                "similarity_boost": style["similarity_boost"],
-                "style": style["style"],
-                "use_speaker_boost": True
-            }
-        }
-        
-        response = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg"
-            },
-            json=payload,
-            timeout=30
+        logger.info(f"Synthesizing with voice: {voice_type} ({voice_id})")
+
+        # ElevenLabs Client
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+        # Match style from FastAPI version
+        voice_settings = VoiceSettings(
+            stability=0.75,
+            similarity_boost=0.75,
+            style=0.0,
+            use_speaker_boost=True
         )
-        
-        if response.status_code != 200:
-            error_msg = f"ElevenLabs API error: {response.status_code} - {response.text}"
-            logger.error(error_msg)
-            return jsonify({"error": error_msg}), 500
-        
-        # Create in-memory audio file
-        audio_buffer = io.BytesIO(response.content)
-        audio_buffer.seek(0)
-        
+
+        # Generate audio
+        audio_stream = client.text_to_speech.convert(
+            text=text,
+            voice_id=voice_id,
+            model_id="eleven_turbo_v2_5",
+            output_format="mp3_44100_128",
+            voice_settings=voice_settings
+        )
+
+        # Save to temp file
+        audio_bytes = b"".join(audio_stream)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        temp_file.write(audio_bytes)
+        temp_file.close()
+
         return send_file(
-            audio_buffer,
+            temp_file.name,
             mimetype='audio/mpeg',
             as_attachment=False
         )
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error: {str(e)}")
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
+
     except Exception as e:
-        logger.exception("Unexpected error in TTS")
+        logger.exception("TTS Error")
         return jsonify({"error": f"TTS Failed: {str(e)}"}), 500
 
 # ... (rest of the endpoints remain unchanged) ...
