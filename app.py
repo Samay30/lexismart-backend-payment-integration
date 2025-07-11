@@ -32,10 +32,7 @@ graph = nx.DiGraph()  # Mind Map Graph
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 # More expressive voices
 VOICES = {
-    "encouraging_female": "EXAVITQu4vr4xnSDxMaL",  # Bella - expressive
-    "warm_male": "VR6AewLTigWG4xSOukaG",           # Antonio - warm tone
-    "enthusiastic": "AZnzlk1XvdvUeBnXmlld",        # Domi - enthusiastic
-    "calm": "IKne3meq5aSn9XLyUdCD"                  # Josh - calm and clear
+    "encouraging_female": "ZT9u07TYPVl83ejeLakq",  # Bella - expressive                
 }
 DEFAULT_VOICE = "encouraging_female"
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -54,6 +51,61 @@ READABILITY_THRESHOLD = 85
 MAX_TEXT_LENGTH = 1000  # ElevenLabs character limit
 
 # ... (rest of helper functions remain unchanged) ...
+def fetch_conceptnet_relations(concept):
+    url = CONCEPTNET_API.format(concept.replace(" ", "_").lower())
+    response = requests.get(url).json()
+    related = set()
+    for edge in response.get("edges", []):
+        end_node = edge["end"]["label"]
+        related.add(end_node)
+        graph.add_edge(concept, end_node)
+    return list(related)
+
+def fetch_dbpedia_relations(concept):
+    query = f"""
+    SELECT ?related WHERE {{
+        <http://dbpedia.org/resource/{concept.replace(' ', '_')}> dbo:wikiPageWikiLink ?related .
+    }} LIMIT 20
+    """
+    params = {"query": query, "format": "json"}
+    response = requests.get(DBPEDIA_API, params=params).json()
+    related = set()
+    for result in response.get("results", {}).get("bindings", []):
+        related_concept = result["related"]["value"].split("/")[-1].replace("_", " ")
+        related.add(related_concept)
+        graph.add_edge(concept, related_concept)
+    return list(related)
+
+def fetch_wikidata_relations(concept):
+    params = {
+        "action": "wbsearchentities",
+        "search": concept,
+        "language": "en",
+        "format": "json"
+    }
+    response = requests.get(WIKIDATA_API, params=params).json()
+    related = set()
+    for entity in response.get("search", []):
+        related.add(entity["label"])
+        graph.add_edge(concept, entity["label"])
+    return list(related)
+
+def extract_textual_concepts(text):
+    doc = nlp(text)
+    return list(set([ent.text for ent in doc.ents]))
+
+def expand_concept_dataset(concept):
+    if concept in concept_relations:
+        return concept_relations[concept]
+    related_concepts = fetch_conceptnet_relations(concept) + fetch_dbpedia_relations(concept) + fetch_wikidata_relations(concept)
+    parent = concept
+    structured_relations = {parent: []}
+    for child in related_concepts:
+        structured_relations[parent].append(child)
+        graph.add_edge(parent, child)
+    concept_relations[concept] = structured_relations
+    return structured_relations
+
 
 def complete_sentence(text):
     """Ensure the summary ends with a complete sentence"""
@@ -194,6 +246,34 @@ def synthesize():
         return jsonify({"error": f"TTS Failed: {str(e)}"}), 500
 
 # ... (rest of the endpoints remain unchanged) ...
+
+@app.route('/api/related-concepts', methods=['POST'])
+def related_concepts():
+    try:
+        data = request.get_json()
+        concept = data.get('concept', '').strip()
+        if not concept:
+            return jsonify({'error': 'No concept provided'}), 400
+        
+        expanded_relations = expand_concept_dataset(concept)
+        return jsonify({
+            'concept': concept,
+            'related_concepts': list(expanded_relations.get(concept, []))[:10] 
+        })
+    except Exception as e:
+        logger.error(f"Related concepts error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/mindmap', methods=['GET'])
+def get_mindmap():
+    try:
+        nodes = [{"id": node} for node in graph.nodes]
+        edges = [{"source": source, "target": target} for source, target in graph.edges]
+        return jsonify({"nodes": nodes, "edges": edges})
+    except Exception as e:
+        logger.error(f"Mindmap error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True)
