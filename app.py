@@ -15,7 +15,7 @@ import tempfile
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 import stripe
 from datetime import datetime, timedelta
-import hashlib  # For password hashing
+import hashlib
 import io
 
 # Load environment variables first
@@ -47,29 +47,7 @@ plans = {
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# ===== NLP & AI COMPONENTS =====
-# Try to load spaCy with fallback
-try:
-    import spacy
-    try:
-        import en_core_web_sm
-        nlp = en_core_web_sm.load()
-        logger.info("Successfully loaded spaCy with en_core_web_sm")
-    except OSError:
-        try:
-            nlp = spacy.load("en_core_web_sm")
-            logger.info("Successfully loaded spaCy en_core_web_sm")
-        except OSError:
-            try:
-                nlp = spacy.blank("en")
-                logger.warning("Using blank English spaCy model - limited functionality")
-            except Exception as e:
-                logger.error(f"Failed to load any spaCy model: {e}")
-                nlp = None
-except ImportError as e:
-    logger.error(f"spaCy not available: {e}")
-    nlp = None
-
+# ===== AI COMPONENTS =====
 graph = nx.DiGraph()
 
 # ElevenLabs Configuration
@@ -91,16 +69,10 @@ MAX_TEXT_LENGTH = 1000
 
 # ===== HELPER FUNCTIONS =====
 def simple_entity_extraction(text):
-    """Fallback entity extraction when spaCy is not available"""
-    if nlp:
-        doc = nlp(text)
-        return [ent.text for ent in doc.ents]
-    else:
-        # Simple regex-based entity extraction as fallback
-        import re
-        # Find capitalized words that might be entities
-        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        return list(set(entities))
+    """Simple regex-based entity extraction as fallback"""
+    # Find capitalized words that might be entities
+    entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+    return list(set(entities))
 
 def fetch_conceptnet_relations(concept):
     try:
@@ -110,9 +82,10 @@ def fetch_conceptnet_relations(concept):
         data = response.json()
         related = set()
         for edge in data.get("edges", []):
-            end_node = edge["end"]["label"]
-            related.add(end_node)
-            graph.add_edge(concept, end_node)
+            if "end" in edge and "label" in edge["end"]:
+                end_node = edge["end"]["label"]
+                related.add(end_node)
+                graph.add_edge(concept, end_node)
         return list(related)
     except Exception as e:
         logger.error(f"ConceptNet API error: {e}")
@@ -131,9 +104,10 @@ def fetch_dbpedia_relations(concept):
         data = response.json()
         related = set()
         for result in data.get("results", {}).get("bindings", []):
-            related_concept = result["related"]["value"].split("/")[-1].replace("_", " ")
-            related.add(related_concept)
-            graph.add_edge(concept, related_concept)
+            if "related" in result and "value" in result["related"]:
+                related_concept = result["related"]["value"].split("/")[-1].replace("_", " ")
+                related.add(related_concept)
+                graph.add_edge(concept, related_concept)
         return list(related)
     except Exception as e:
         logger.error(f"DBpedia API error: {e}")
@@ -152,8 +126,9 @@ def fetch_wikidata_relations(concept):
         data = response.json()
         related = set()
         for entity in data.get("search", []):
-            related.add(entity["label"])
-            graph.add_edge(concept, entity["label"])
+            if "label" in entity:
+                related.add(entity["label"])
+                graph.add_edge(concept, entity["label"])
         return list(related)
     except Exception as e:
         logger.error(f"Wikidata API error: {e}")
@@ -296,7 +271,7 @@ def summarize():
                         "requests_remaining": user["request_limit"] - user["requests_used"]
                     })
                 time.sleep(1)
-            except openai.error.OpenAIError as e:
+            except Exception as e:
                 logger.error(f"OpenAI API error: {str(e)}")
                 return jsonify({"error": f"AI service error: {str(e)}"}), 500
 
@@ -442,15 +417,31 @@ def get_mindmap():
         logger.error(f"Mindmap error: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
+@app.route('/api/extract-entities', methods=['POST'])
+def extract_entities():
+    """Extract entities from text using simple regex patterns"""
+    try:
+        data = request.get_json()
+        text = data.get('text', '').strip()
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        entities = simple_entity_extraction(text)
+        return jsonify({'entities': entities})
+    except Exception as e:
+        logger.error(f"Entity extraction error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "spacy_available": nlp is not None,
+        "spacy_available": False,
         "openai_configured": bool(openai.api_key),
         "elevenlabs_configured": bool(ELEVENLABS_API_KEY)
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=os.environ.get('FLASK_DEBUG', False))
+    # This only runs when testing locally, not on Render
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
