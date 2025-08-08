@@ -48,7 +48,8 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 # ===== NLP & AI COMPONENTS =====
-nlp = spacy.load("en_core_web_sm")
+import en_core_web_sm
+nlp = en_core_web_sm.load()
 graph = nx.DiGraph()
 
 # ElevenLabs Configuration

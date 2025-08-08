@@ -1,3 +1,5 @@
 build-essential
 gfortran
 libopenblas-dev
+libatlas-base-dev  # Add this
+python3-dev  # Add this
