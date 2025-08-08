@@ -3,7 +3,6 @@ from flask_cors import CORS
 import logging
 import os
 import requests
-import spacy
 import networkx as nx
 import json
 from dotenv import load_dotenv
@@ -17,6 +16,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 import stripe
 from datetime import datetime, timedelta
 import hashlib  # For password hashing
+import io
 
 # Load environment variables first
 load_dotenv()
@@ -48,8 +48,28 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 # ===== NLP & AI COMPONENTS =====
-import en_core_web_sm
-nlp = en_core_web_sm.load()
+# Try to load spaCy with fallback
+try:
+    import spacy
+    try:
+        import en_core_web_sm
+        nlp = en_core_web_sm.load()
+        logger.info("Successfully loaded spaCy with en_core_web_sm")
+    except OSError:
+        try:
+            nlp = spacy.load("en_core_web_sm")
+            logger.info("Successfully loaded spaCy en_core_web_sm")
+        except OSError:
+            try:
+                nlp = spacy.blank("en")
+                logger.warning("Using blank English spaCy model - limited functionality")
+            except Exception as e:
+                logger.error(f"Failed to load any spaCy model: {e}")
+                nlp = None
+except ImportError as e:
+    logger.error(f"spaCy not available: {e}")
+    nlp = None
+
 graph = nx.DiGraph()
 
 # ElevenLabs Configuration
@@ -70,44 +90,74 @@ READABILITY_THRESHOLD = 85
 MAX_TEXT_LENGTH = 1000
 
 # ===== HELPER FUNCTIONS =====
+def simple_entity_extraction(text):
+    """Fallback entity extraction when spaCy is not available"""
+    if nlp:
+        doc = nlp(text)
+        return [ent.text for ent in doc.ents]
+    else:
+        # Simple regex-based entity extraction as fallback
+        import re
+        # Find capitalized words that might be entities
+        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+        return list(set(entities))
+
 def fetch_conceptnet_relations(concept):
-    url = CONCEPTNET_API.format(concept.replace(" ", "_").lower())
-    response = requests.get(url).json()
-    related = set()
-    for edge in response.get("edges", []):
-        end_node = edge["end"]["label"]
-        related.add(end_node)
-        graph.add_edge(concept, end_node)
-    return list(related)
+    try:
+        url = CONCEPTNET_API.format(concept.replace(" ", "_").lower())
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        related = set()
+        for edge in data.get("edges", []):
+            end_node = edge["end"]["label"]
+            related.add(end_node)
+            graph.add_edge(concept, end_node)
+        return list(related)
+    except Exception as e:
+        logger.error(f"ConceptNet API error: {e}")
+        return []
 
 def fetch_dbpedia_relations(concept):
-    query = f"""
-    SELECT ?related WHERE {{
-        <http://dbpedia.org/resource/{concept.replace(' ', '_')}> dbo:wikiPageWikiLink ?related .
-    }} LIMIT 20
-    """
-    params = {"query": query, "format": "json"}
-    response = requests.get(DBPEDIA_API, params=params).json()
-    related = set()
-    for result in response.get("results", {}).get("bindings", []):
-        related_concept = result["related"]["value"].split("/")[-1].replace("_", " ")
-        related.add(related_concept)
-        graph.add_edge(concept, related_concept)
-    return list(related)
+    try:
+        query = f"""
+        SELECT ?related WHERE {{
+            <http://dbpedia.org/resource/{concept.replace(' ', '_')}> dbo:wikiPageWikiLink ?related .
+        }} LIMIT 20
+        """
+        params = {"query": query, "format": "json"}
+        response = requests.get(DBPEDIA_API, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        related = set()
+        for result in data.get("results", {}).get("bindings", []):
+            related_concept = result["related"]["value"].split("/")[-1].replace("_", " ")
+            related.add(related_concept)
+            graph.add_edge(concept, related_concept)
+        return list(related)
+    except Exception as e:
+        logger.error(f"DBpedia API error: {e}")
+        return []
 
 def fetch_wikidata_relations(concept):
-    params = {
-        "action": "wbsearchentities",
-        "search": concept,
-        "language": "en",
-        "format": "json"
-    }
-    response = requests.get(WIKIDATA_API, params=params).json()
-    related = set()
-    for entity in response.get("search", []):
-        related.add(entity["label"])
-        graph.add_edge(concept, entity["label"])
-    return list(related)
+    try:
+        params = {
+            "action": "wbsearchentities",
+            "search": concept,
+            "language": "en",
+            "format": "json"
+        }
+        response = requests.get(WIKIDATA_API, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        related = set()
+        for entity in data.get("search", []):
+            related.add(entity["label"])
+            graph.add_edge(concept, entity["label"])
+        return list(related)
+    except Exception as e:
+        logger.error(f"Wikidata API error: {e}")
+        return []
 
 def expand_concept_dataset(concept):
     if concept in concept_relations:
@@ -391,6 +441,16 @@ def get_mindmap():
     except Exception as e:
         logger.error(f"Mindmap error: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "spacy_available": nlp is not None,
+        "openai_configured": bool(openai.api_key),
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY)
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=os.environ.get('FLASK_DEBUG', False))
