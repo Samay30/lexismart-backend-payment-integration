@@ -5,7 +5,7 @@ Flask-JWT-Extended==4.5.3
 gunicorn==21.2.0
 
 # Database - Use psycopg2-binary instead of psycopg2
-psycopg2-binary==2.9.7
+psycopg2-binary==2.9.10
 
 # External APIs
 requests==2.31.0
