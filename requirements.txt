@@ -1,12 +1,28 @@
+# Core Flask dependencies
 Flask==2.3.3
 Flask-CORS==4.0.0
 Flask-JWT-Extended==4.5.3
-python-dotenv==1.0.0
-psycopg2-binary==2.9.7
-stripe==6.6.0
-requests==2.31.0
-networkx==3.1
-openai==0.28.1
-elevenlabs==0.2.26
-textstat==0.7.3
 gunicorn==21.2.0
+
+# Database - Use psycopg2-binary instead of psycopg2
+psycopg2-binary==2.9.7
+
+# External APIs
+requests==2.31.0
+stripe==6.6.0
+openai==0.28.0
+
+# Audio/TTS - Make elevenlabs optional for deployment
+# elevenlabs==0.2.26
+
+# Graph/Network analysis
+networkx==3.1
+
+# Security
+python-dotenv==1.0.0
+
+# Text processing (optional - handle missing gracefully)
+# textstat==0.7.3
+
+# Development tools (not needed for production)
+# python-decouple==3.8
