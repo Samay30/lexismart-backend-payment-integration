@@ -334,7 +334,7 @@ def synthesize():
             )
         except (AttributeError, NameError):
             # Fallback to older API pattern
-            import elevenlabs
+            
             elevenlabs.set_api_key(ELEVENLABS_API_KEY)
             audio_bytes = elevenlabs.generate(
                 text=text,
@@ -359,34 +359,126 @@ def synthesize():
         return jsonify({"error": "Voice generation failed"}), 500
 
 # ===== SUBSCRIPTION MANAGEMENT =====
+# Updated Flask route with proper error handling and debugging
+
 @app.route('/api/create-subscription', methods=['POST'])
 @jwt_required()
 def create_subscription():
     email = get_jwt_identity()
     user = users_db.get(email)
+    
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
     data = request.get_json()
     plan_type = data.get('plan', 'student')
     
-    if plan_type not in plans or not plans[plan_type]["price_id"]:
-        return jsonify({"error": "Invalid plan selected"}), 400
+    # Debug logging
+    logger.info(f"Creating subscription for user: {email}, plan: {plan_type}")
+    logger.info(f"Available plans: {list(plans.keys())}")
+    logger.info(f"Plan price ID: {plans.get(plan_type, {}).get('price_id')}")
+    
+    if plan_type not in plans:
+        return jsonify({"error": f"Invalid plan selected: {plan_type}"}), 400
+    
+    price_id = plans[plan_type]["price_id"]
+    if not price_id:
+        return jsonify({"error": f"Price ID not configured for plan: {plan_type}"}), 400
     
     try:
+        # Verify customer exists in Stripe
+        customer_id = user["stripe_customer_id"]
+        try:
+            stripe.Customer.retrieve(customer_id)
+        except stripe.error.InvalidRequestError:
+            logger.error(f"Invalid customer ID: {customer_id}")
+            return jsonify({"error": "Customer not found in payment system"}), 400
+        
+        # Create checkout session with proper configuration
         session = stripe.checkout.Session.create(
-            customer=user["stripe_customer_id"],
+            customer=customer_id,
             payment_method_types=['card'],
             line_items=[{
-                'price': plans[plan_type]["price_id"],
+                'price': price_id,
                 'quantity': 1,
             }],
             mode='subscription',
-            success_url=f"{os.getenv('FRONTEND_URL')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{os.getenv('FRONTEND_URL')}/cancel",
+            success_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/cancel",
+            # Add metadata for easier tracking
+            metadata={
+                'user_email': email,
+                'plan_type': plan_type
+            },
+            # Allow promotion codes
+            allow_promotion_codes=True,
+            # Set billing address collection
+            billing_address_collection='required'
         )
-        return jsonify(sessionId=session.id)
+        
+        logger.info(f"Checkout session created: {session.id}")
+        return jsonify({"sessionId": session.id})
+        
     except stripe.error.StripeError as e:
-        logger.error(f"Stripe Checkout error: {str(e)}")
-        return jsonify({"error": "Payment processing failed"}), 500
+        logger.error(f"Stripe error: {str(e)}")
+        logger.error(f"Stripe error type: {type(e).__name__}")
+        logger.error(f"Error details: {e.user_message if hasattr(e, 'user_message') else 'No user message'}")
+        
+        # Return more specific error messages
+        if isinstance(e, stripe.error.InvalidRequestError):
+            return jsonify({"error": f"Invalid request: {str(e)}"}), 400
+        elif isinstance(e, stripe.error.AuthenticationError):
+            return jsonify({"error": "Payment system authentication failed"}), 500
+        elif isinstance(e, stripe.error.APIConnectionError):
+            return jsonify({"error": "Payment system connection failed"}), 503
+        else:
+            return jsonify({"error": f"Payment processing failed: {str(e)}"}), 500
+    
+    except Exception as e:
+        logger.exception(f"Unexpected error in subscription creation: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
+
+# Enhanced environment variable validation
+def validate_environment():
+    """Validate all required environment variables"""
+    required_vars = {
+        'STRIPE_SECRET_KEY': os.getenv('STRIPE_SECRET_KEY'),
+        'STRIPE_STUDENT_PRICE_ID': os.getenv('STRIPE_STUDENT_PRICE_ID'),
+        'STRIPE_PRO_PRICE_ID': os.getenv('STRIPE_PRO_PRICE_ID'),
+        'FRONTEND_URL': os.getenv('FRONTEND_URL'),
+        'JWT_SECRET': os.getenv('JWT_SECRET')
+    }
+    
+    missing_vars = [key for key, value in required_vars.items() if not value]
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {missing_vars}")
+        return False
+    
+    # Test Stripe configuration
+    try:
+        stripe.api_key = required_vars['STRIPE_SECRET_KEY']
+        stripe.Account.retrieve()
+        logger.info("Stripe API key validated successfully")
+    except stripe.error.AuthenticationError:
+        logger.error("Invalid Stripe API key")
+        return False
+    except Exception as e:
+        logger.error(f"Stripe validation error: {str(e)}")
+        return False
+    
+    return True
+
+# Add this validation at app startup
+if __name__ == '__main__' or __name__ == 'app':
+    if not validate_environment():
+        logger.error("Environment validation failed. Please check your configuration.")
+        # In production, you might want to exit here
+        # sys.exit(1)
+
+
+# Enhanced webhook handler with better error handling
 @app.route('/api/stripe-webhook', methods=['POST'])
 def stripe_webhook():
     payload = request.data
@@ -394,39 +486,121 @@ def stripe_webhook():
     webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
     
     if not webhook_secret:
+        logger.error("Webhook secret not configured")
         return jsonify({"error": "Webhook secret not configured"}), 500
     
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, webhook_secret
         )
+        logger.info(f"Webhook event received: {event['type']}")
     except ValueError as e:
+        logger.error(f"Invalid payload: {str(e)}")
         return jsonify({"error": "Invalid payload"}), 400
     except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Invalid signature: {str(e)}")
         return jsonify({"error": "Invalid signature"}), 400
     
-    # Handle subscription events
-    if event['type'] == 'customer.subscription.updated':
-        subscription = event['data']['object']
-        customer_id = subscription['customer']
+    try:
+        # Handle different event types
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            logger.info(f"Checkout session completed: {session['id']}")
+            
+            # Handle successful payment
+            customer_id = session['customer']
+            subscription_id = session.get('subscription')
+            
+            if subscription_id:
+                subscription = stripe.Subscription.retrieve(subscription_id)
+                handle_successful_subscription(customer_id, subscription)
         
-        if subscription['status'] == 'active':
-            # Determine plan from price ID
-            price_id = subscription['items']['data'][0]['price']['id']
-            plan_type = "student" if price_id == plans["student"]["price_id"] else "pro"
+        elif event['type'] == 'customer.subscription.updated':
+            subscription = event['data']['object']
+            customer_id = subscription['customer']
+            logger.info(f"Subscription updated for customer: {customer_id}")
             
-            # Update subscription status
-            subscriptions_db[customer_id] = plan_type
+            if subscription['status'] == 'active':
+                handle_successful_subscription(customer_id, subscription)
+        
+        elif event['type'] == 'customer.subscription.deleted':
+            subscription = event['data']['object']
+            customer_id = subscription['customer']
+            logger.info(f"Subscription cancelled for customer: {customer_id}")
             
-            # Find user and update plan
+            # Downgrade user to free plan
             for email, user in users_db.items():
                 if user["stripe_customer_id"] == customer_id:
-                    user["subscription"] = plan_type
-                    user["request_limit"] = plans[plan_type]["requests"]
-                    user["reset_date"] = datetime.utcnow() + timedelta(days=30)
+                    user["subscription"] = "free"
+                    user["request_limit"] = plans["free"]["requests"]
+                    user["requests_used"] = 0
+                    logger.info(f"User {email} downgraded to free plan")
                     break
+        
+        return jsonify({"status": "success"}), 200
     
-    return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.exception(f"Webhook processing error: {str(e)}")
+        return jsonify({"error": "Webhook processing failed"}), 500
+
+
+def handle_successful_subscription(customer_id, subscription):
+    """Handle successful subscription activation"""
+    try:
+        # Determine plan from price ID
+        price_id = subscription['items']['data'][0]['price']['id']
+        plan_type = None
+        
+        for plan_name, plan_data in plans.items():
+            if plan_data.get("price_id") == price_id:
+                plan_type = plan_name
+                break
+        
+        if not plan_type:
+            logger.error(f"Unknown price ID: {price_id}")
+            return
+        
+        # Update subscription status
+        subscriptions_db[customer_id] = plan_type
+        
+        # Find user and update plan
+        for email, user in users_db.items():
+            if user["stripe_customer_id"] == customer_id:
+                user["subscription"] = plan_type
+                user["request_limit"] = plans[plan_type]["requests"]
+                user["requests_used"] = 0  # Reset usage count
+                user["reset_date"] = datetime.utcnow() + timedelta(days=30)
+                logger.info(f"User {email} upgraded to {plan_type} plan")
+                break
+        else:
+            logger.error(f"User not found for customer ID: {customer_id}")
+    
+    except Exception as e:
+        logger.exception(f"Error handling successful subscription: {str(e)}")
+
+
+# Add a health check endpoint for payment system
+@app.route('/api/payment-health', methods=['GET'])
+def payment_health():
+    """Check payment system health"""
+    health_status = {
+        "stripe_configured": bool(os.getenv('STRIPE_SECRET_KEY')),
+        "webhook_configured": bool(os.getenv('STRIPE_WEBHOOK_SECRET')),
+        "price_ids_configured": {
+            "student": bool(os.getenv('STRIPE_STUDENT_PRICE_ID')),
+            "pro": bool(os.getenv('STRIPE_PRO_PRICE_ID'))
+        },
+        "frontend_url": os.getenv('FRONTEND_URL', 'Not configured')
+    }
+    
+    try:
+        # Test Stripe connection
+        stripe.Account.retrieve()
+        health_status["stripe_connection"] = "OK"
+    except Exception as e:
+        health_status["stripe_connection"] = f"Error: {str(e)}"
+    
+    return jsonify(health_status)
 
 # ===== OTHER ENDPOINTS =====
 @app.route('/api/related-concepts', methods=['POST'])
