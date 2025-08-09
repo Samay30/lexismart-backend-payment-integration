@@ -45,7 +45,7 @@ if not DATABASE_URL:
 try:
     db_pool = ThreadedConnectionPool(
         minconn=1,
-        maxconn=20,
+        maxconn=10,  # Reduced for Render's free tier
         dsn=DATABASE_URL,
         cursor_factory=psycopg2.extras.RealDictCursor
     )
@@ -175,10 +175,20 @@ def init_database():
 # -----------------------
 app = Flask(__name__)
 
+# Get allowed origins from environment or use defaults
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
+if not allowed_origins or allowed_origins[0] == "":
+    allowed_origins = [
+        FRONTEND_URL, 
+        "https://*.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ]
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": [FRONTEND_URL, "https://*.netlify.app"]}},
+    resources={r"/api/*": {"origins": allowed_origins}},
     supports_credentials=True
 )
 
@@ -335,7 +345,8 @@ def health_check():
         "openai_configured": bool(OPENAI_API_KEY),
         "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
         "elevenlabs_available": ELEVENLABS_AVAILABLE,
-        "stripe_configured": bool(STRIPE_SECRET_KEY)
+        "stripe_configured": bool(STRIPE_SECRET_KEY),
+        "allowed_origins": allowed_origins
     }), 200
 
 # Registration and authentication
@@ -375,45 +386,6 @@ def register_post():
 
     except Exception as e:
         logger.error(f"Registration error: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": "Registration failed. Please try again later."}), 500
-
-# GET version for current frontend (query params)
-@app.get("/api/register")
-def register_get():
-    try:
-        email = (request.args.get("email") or "").strip().lower()
-        password = (request.args.get("password") or "").strip()
-
-        if not email or not password:
-            return jsonify({"error": "Email and password are required"}), 400
-        if len(password) < 6:
-            return jsonify({"error": "Password must be at least 6 characters long"}), 400
-        if "@" not in email or "." not in email:
-            return jsonify({"error": "Please enter a valid email address"}), 400
-
-        existing_user = get_user_by_email(email)
-        if existing_user:
-            return jsonify({"error": "An account with this email already exists"}), 400
-
-        stripe_customer_id = None
-        try:
-            customer = stripe.Customer.create(email=email)
-            stripe_customer_id = customer.id
-            logger.info(f"[GET] Created Stripe customer {stripe_customer_id} for {email}")
-        except stripe.error.StripeError as e:
-            logger.error(f"[GET] Stripe customer creation failed: {e}")
-
-        password_hash = hash_password(password)
-        user_result = create_user(email, password_hash, stripe_customer_id)
-        if not user_result:
-            return jsonify({"error": "Failed to create user account"}), 500
-
-        logger.info(f"[GET] User registered successfully: {email}")
-        return jsonify({"message": "Account created successfully! Please login."}), 201
-
-    except Exception as e:
-        logger.error(f"Registration error (GET): {e}")
         logger.error(traceback.format_exc())
         return jsonify({"error": "Registration failed. Please try again later."}), 500
 
@@ -838,17 +810,7 @@ def summarize():
         logger.error(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
 
-# TTS endpoint omitted for brevity; unchanged from original but with @jwt_required
-
-# Mind Map endpoints omitted for brevity; unchanged
-
-# Related concepts, mindmap graph, extract entities, analytics omitted; unchanged
-
-# Environment validation and startup omitted; unchanged
-
-# -----------------------
-# Enhanced TTS
-# -----------------------
+# TTS endpoint
 @app.post("/api/synthesize")
 @jwt_required()
 def synthesize():
@@ -914,9 +876,7 @@ def synthesize():
         logger.error(f"TTS error: {e}")
         return jsonify({"error": "Voice generation failed"}), 500
 
-# -----------------------
 # Mind Map Storage
-# -----------------------
 @app.post("/api/save-mindmap")
 @jwt_required()
 def save_mindmap():
@@ -1007,9 +967,7 @@ def get_mindmap(mindmap_id):
         logger.error(f"Get mindmap error: {e}")
         return jsonify({"error": "Failed to fetch mind map"}), 500
 
-# -----------------------
-# AI Knowledge helpers (unchanged but with error handling)
-# -----------------------
+# Related concepts
 graph = nx.DiGraph()
 CONCEPTNET_API = "https://api.conceptnet.io/query?node=/c/en/{}&rel=/r/RelatedTo&limit=20"
 DBPEDIA_API = "http://dbpedia.org/sparql"
@@ -1133,9 +1091,7 @@ def extract_entities():
         logger.error(f"Entity extraction error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-# -----------------------
 # Analytics endpoint
-# -----------------------
 @app.get("/api/analytics")
 @jwt_required()
 def get_analytics():
@@ -1172,9 +1128,7 @@ def get_analytics():
         logger.error(f"Analytics error: {e}")
         return jsonify({"error": "Failed to fetch analytics"}), 500
 
-# -----------------------
 # Environment Validation
-# -----------------------
 def validate_environment() -> bool:
     """Validate required environment variables"""
     required = {
