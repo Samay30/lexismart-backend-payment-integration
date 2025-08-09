@@ -6,8 +6,12 @@ import time
 import hashlib
 import logging
 import tempfile
+import traceback
 from datetime import datetime, timedelta
 
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 import requests
 import networkx as nx
 import stripe
@@ -23,8 +27,144 @@ from flask_jwt_extended import (
 # -----------------------
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# -----------------------
+# Database Configuration
+# -----------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    logger.error("DATABASE_URL environment variable is required")
+    raise ValueError("DATABASE_URL is required")
+
+# Initialize connection pool
+try:
+    db_pool = ThreadedConnectionPool(
+        minconn=1,
+        maxconn=20,
+        dsn=DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+    logger.info("Database connection pool initialized")
+except Exception as e:
+    logger.error(f"Failed to initialize database pool: {e}")
+    raise
+
+def get_db_connection():
+    """Get database connection from pool"""
+    try:
+        return db_pool.getconn()
+    except Exception as e:
+        logger.error(f"Failed to get database connection: {e}")
+        raise
+
+def return_db_connection(conn):
+    """Return database connection to pool"""
+    try:
+        db_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"Failed to return database connection: {e}")
+
+def execute_query(query, params=None, fetch=False, fetch_one=False):
+    """Execute database query with proper connection handling"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        
+        if fetch_one:
+            result = cursor.fetchone()
+        elif fetch:
+            result = cursor.fetchall()
+        else:
+            result = None
+            
+        conn.commit()
+        return result
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Database error: {e}")
+        logger.error(f"Query: {query}")
+        logger.error(f"Params: {params}")
+        raise
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def init_database():
+    """Initialize database tables"""
+    try:
+        # Users table
+        execute_query("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                stripe_customer_id VARCHAR(255),
+                subscription VARCHAR(50) DEFAULT 'free',
+                requests_used INTEGER DEFAULT 0,
+                request_limit INTEGER DEFAULT 5,
+                reset_date TIMESTAMP DEFAULT NOW() + INTERVAL '7 days',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
+        # Subscriptions table for tracking Stripe subscriptions
+        execute_query("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                stripe_subscription_id VARCHAR(255),
+                stripe_customer_id VARCHAR(255),
+                plan_name VARCHAR(100),
+                status VARCHAR(50),
+                current_period_start TIMESTAMP,
+                current_period_end TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
+        # Mind maps table
+        execute_query("""
+            CREATE TABLE IF NOT EXISTS mindmaps (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(255),
+                nodes_data JSONB,
+                edges_data JSONB,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
+        # Usage analytics table
+        execute_query("""
+            CREATE TABLE IF NOT EXISTS usage_analytics (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                action_type VARCHAR(100),
+                metadata JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
+        # Create indexes for better performance
+        execute_query("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
+        execute_query("CREATE INDEX IF NOT EXISTS idx_subscriptions_customer_id ON subscriptions(stripe_customer_id);")
+        execute_query("CREATE INDEX IF NOT EXISTS idx_mindmaps_user_id ON mindmaps(user_id);")
+        
+        logger.info("Database tables initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
 
 # -----------------------
 # App & CORS
@@ -34,7 +174,7 @@ app = Flask(__name__)
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 CORS(
     app,
-    resources={r"/api/*": {"origins": [FRONTEND_URL]}},
+    resources={r"/api/*": {"origins": [FRONTEND_URL, "https://*.netlify.app"]}},
     supports_credentials=True
 )
 
@@ -42,6 +182,7 @@ CORS(
 # JWT & Stripe
 # -----------------------
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET", "fallback_secret_key")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 jwt = JWTManager(app)
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -72,37 +213,32 @@ except Exception:
             ELEVENLABS_AVAILABLE = False
             logger.warning("ElevenLabs SDK not available; TTS endpoint will be disabled.")
 
-# OpenAI (legacy SDK usage to match your earlier code)
+# OpenAI
 import openai
 openai.api_key = OPENAI_API_KEY
 
 # -----------------------
-# App State / “DB” (replace with real DB in prod)
+# Product catalog
 # -----------------------
-users_db = {}
-subscriptions_db = {}  # stripe_customer_id -> plan name
-
-# Product catalog — INR prices (adaptive pricing active in Stripe)
 plans = {
     "free": {
         "requests": 5,
-        "price_ids": {}  # no price for free
+        "price_ids": {}
     },
     "LexiSmart Students": {
         "requests": 200,
         "price_ids": {
-            "INR": os.getenv("PRICE_ID_STUDENT_INR")  # price_inr_...
+            "INR": os.getenv("PRICE_ID_STUDENT_INR")
         }
     },
     "LexiSmart Premium": {
         "requests": 10000,
         "price_ids": {
-            "INR": os.getenv("PRICE_ID_PRO_INR")  # price_inr_...
+            "INR": os.getenv("PRICE_ID_PRO_INR")
         }
     }
 }
 
-# Allow shorthand names from frontend
 PLAN_ALIASES = {
     "student": "LexiSmart Students",
     "pro": "LexiSmart Premium",
@@ -121,7 +257,803 @@ def resolve_plan_by_price_id(price_id: str):
     return None
 
 # -----------------------
-# AI / Knowledge helpers
+# Database Helper Functions
+# -----------------------
+def get_user_by_email(email):
+    """Get user by email from database"""
+    return execute_query(
+        "SELECT * FROM users WHERE email = %s",
+        (email,),
+        fetch_one=True
+    )
+
+def get_user_by_id(user_id):
+    """Get user by ID from database"""
+    return execute_query(
+        "SELECT * FROM users WHERE id = %s",
+        (user_id,),
+        fetch_one=True
+    )
+
+def create_user(email, password_hash, stripe_customer_id=None):
+    """Create new user in database"""
+    return execute_query(
+        """
+        INSERT INTO users (email, password_hash, stripe_customer_id, subscription, requests_used, request_limit, reset_date)
+        VALUES (%s, %s, %s, 'free', 0, %s, %s)
+        RETURNING id
+        """,
+        (email, password_hash, stripe_customer_id, plans["free"]["requests"], 
+         datetime.utcnow() + timedelta(days=7)),
+        fetch_one=True
+    )
+
+def update_user_subscription(user_id, plan_name, request_limit, reset_date=None):
+    """Update user subscription in database"""
+    if reset_date is None:
+        reset_date = datetime.utcnow() + timedelta(days=30)
+    
+    execute_query(
+        """
+        UPDATE users 
+        SET subscription = %s, request_limit = %s, reset_date = %s, 
+            requests_used = 0, updated_at = NOW()
+        WHERE id = %s
+        """,
+        (plan_name, request_limit, reset_date, user_id)
+    )
+
+def increment_user_requests(user_id):
+    """Increment user's request count"""
+    execute_query(
+        "UPDATE users SET requests_used = requests_used + 1, updated_at = NOW() WHERE id = %s",
+        (user_id,)
+    )
+
+def log_usage(user_id, action_type, metadata=None):
+    """Log user action for analytics"""
+    try:
+        execute_query(
+            "INSERT INTO usage_analytics (user_id, action_type, metadata) VALUES (%s, %s, %s)",
+            (user_id, action_type, json.dumps(metadata) if metadata else None)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to log usage: {e}")
+
+# -----------------------
+# Password hashing
+# -----------------------
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password, password_hash):
+    return hash_password(password) == password_hash
+
+# -----------------------
+# Health & Root
+# -----------------------
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    return jsonify(status="ok"), 200
+
+@app.get("/api/health")
+def health_check():
+    try:
+        # Test database connection
+        execute_query("SELECT 1", fetch_one=True)
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return jsonify({
+        "status": "healthy",
+        "database": db_status,
+        "openai_configured": bool(OPENAI_API_KEY),
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
+        "elevenlabs_available": ELEVENLABS_AVAILABLE,
+        "stripe_configured": bool(STRIPE_SECRET_KEY)
+    }), 200
+
+# -----------------------
+# Enhanced Auth with proper error handling
+# -----------------------
+@app.post("/api/register")
+def register():
+    try:
+        data = request.get_json() or {}
+        email = data.get("email", "").strip().lower()
+        password = data.get("password", "").strip()
+
+        # Validation
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+        
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters long"}), 400
+        
+        if "@" not in email or "." not in email:
+            return jsonify({"error": "Please enter a valid email address"}), 400
+
+        # Check if user already exists
+        existing_user = get_user_by_email(email)
+        if existing_user:
+            return jsonify({"error": "An account with this email already exists"}), 400
+
+        # Create Stripe customer
+        stripe_customer_id = None
+        try:
+            customer = stripe.Customer.create(email=email)
+            stripe_customer_id = customer.id
+            logger.info(f"Created Stripe customer {stripe_customer_id} for {email}")
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe customer creation failed: {e}")
+            # Don't fail registration if Stripe fails
+            pass
+
+        # Create user in database
+        password_hash = hash_password(password)
+        user_result = create_user(email, password_hash, stripe_customer_id)
+        
+        if not user_result:
+            return jsonify({"error": "Failed to create user account"}), 500
+
+        logger.info(f"User registered successfully: {email}")
+        return jsonify({"message": "Account created successfully! Please login."}), 201
+
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Registration failed. Please try again later."}), 500
+
+@app.post("/api/login")
+def login():
+    try:
+        data = request.get_json() or {}
+        email = data.get("email", "").strip().lower()
+        password = data.get("password", "").strip()
+
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+
+        # Get user from database
+        user = get_user_by_email(email)
+        if not user:
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        # Verify password
+        if not verify_password(password, user["password_hash"]):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        # Log successful login
+        log_usage(user["id"], "login")
+
+        # Generate JWT token
+        access_token = create_access_token(
+            identity=str(user["id"]),
+            expires_delta=timedelta(hours=24)
+        )
+
+        logger.info(f"User logged in successfully: {email}")
+        return jsonify({
+            "access_token": access_token,
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "subscription": user["subscription"],
+                "requests_used": user["requests_used"],
+                "request_limit": user["request_limit"]
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Login failed. Please try again later."}), 500
+
+@app.get("/api/user")
+@jwt_required()
+def get_user():
+    try:
+        user_id = get_jwt_identity()
+        user = get_user_by_id(int(user_id))
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "id": user["id"],
+            "email": user["email"],
+            "subscription": user["subscription"],
+            "requests_used": user["requests_used"],
+            "request_limit": user["request_limit"],
+            "reset_date": user["reset_date"].isoformat() if user["reset_date"] else None
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Get user error: {e}")
+        return jsonify({"error": "Failed to fetch user data"}), 500
+
+# -----------------------
+# Payment Config & Health
+# -----------------------
+@app.get("/api/payment-health")
+def payment_health():
+    status = {
+        "stripe_configured": bool(STRIPE_SECRET_KEY),
+        "webhook_configured": bool(STRIPE_WEBHOOK_SECRET),
+        "price_ids_configured": {
+            "student_inr": bool(plans["LexiSmart Students"]["price_ids"].get("INR")),
+            "pro_inr": bool(plans["LexiSmart Premium"]["price_ids"].get("INR")),
+        },
+        "frontend_url": FRONTEND_URL
+    }
+    
+    if STRIPE_SECRET_KEY:
+        try:
+            acct = stripe.Account.retrieve()
+            status["stripe_connection"] = "OK"
+            status["account_country"] = acct.get("country")
+            status["default_currency"] = acct.get("default_currency")
+        except Exception as e:
+            status["stripe_connection"] = f"Error: {e}"
+    else:
+        status["stripe_connection"] = "Not configured"
+    
+    return jsonify(status), 200
+
+@app.get("/api/payment-config")
+def payment_config():
+    """Returns live amounts & currency from Stripe for INR price IDs."""
+    out = {"currency": "INR", "plans": {}}
+    
+    for key in ("LexiSmart Students", "LexiSmart Premium"):
+        pid = plans[key]["price_ids"].get("INR")
+        if not pid:
+            out["plans"][key] = {"amount": None, "interval": "month", "price_id": None}
+            continue
+            
+        try:
+            price = stripe.Price.retrieve(pid)
+            amount_major = (price["unit_amount"] or 0) / 100.0
+            interval = price.get("recurring", {}).get("interval", "month")
+            out["plans"][key] = {
+                "amount": amount_major,
+                "interval": interval,
+                "price_id": pid
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch price {pid}: {e}")
+            out["plans"][key] = {"amount": None, "interval": "month", "price_id": pid}
+    
+    return jsonify(out), 200
+
+# -----------------------
+# Enhanced Subscription Creation
+# -----------------------
+@app.post("/api/create-subscription")
+@jwt_required()
+def create_subscription():
+    try:
+        user_id = get_jwt_identity()
+        user = get_user_by_id(int(user_id))
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        data = request.get_json() or {}
+        plan_input = data.get("plan")
+        plan_key = resolve_plan_key(plan_input)
+
+        logger.info(f"Creating subscription for user {user_id}: plan_input={plan_input} -> plan_key={plan_key}")
+
+        if plan_key not in plans or plan_key == "free":
+            return jsonify({"error": f"Invalid plan: {plan_input}"}), 400
+
+        price_id = plans[plan_key]["price_ids"].get("INR")
+        if not price_id:
+            return jsonify({"error": f"Price ID (INR) not configured for plan {plan_key}"}), 500
+
+        # Ensure Stripe customer exists
+        customer_id = user["stripe_customer_id"]
+        if not customer_id:
+            try:
+                customer = stripe.Customer.create(email=user["email"])
+                customer_id = customer.id
+                # Update user with stripe customer ID
+                execute_query(
+                    "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
+                    (customer_id, user_id)
+                )
+                logger.info(f"Created Stripe customer {customer_id} for existing user")
+            except stripe.error.StripeError as e:
+                logger.error(f"Failed to create Stripe customer: {e}")
+                return jsonify({"error": "Payment system error"}), 500
+        else:
+            # Verify customer still exists
+            try:
+                stripe.Customer.retrieve(customer_id)
+            except stripe.error.InvalidRequestError:
+                try:
+                    customer = stripe.Customer.create(email=user["email"])
+                    customer_id = customer.id
+                    execute_query(
+                        "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
+                        (customer_id, user_id)
+                    )
+                except stripe.error.StripeError as e:
+                    logger.error(f"Failed to recreate Stripe customer: {e}")
+                    return jsonify({"error": "Payment system error"}), 500
+
+        # Create checkout session
+        try:
+            session = stripe.checkout.Session.create(
+                customer=customer_id,
+                mode="subscription",
+                line_items=[{"price": price_id, "quantity": 1}],
+                success_url=f"{FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{FRONTEND_URL}/cancel",
+                allow_promotion_codes=True,
+                billing_address_collection="required",
+                metadata={
+                    "user_id": user_id,
+                    "user_email": user["email"], 
+                    "plan_type": plan_key
+                },
+                client_reference_id=str(user_id)
+            )
+            
+            logger.info(f"Checkout session created: {session.id} for user {user_id}")
+            log_usage(int(user_id), "subscription_checkout_created", {"plan": plan_key, "session_id": session.id})
+            
+            return jsonify({
+                "sessionId": session.id, 
+                "currency_used": "INR"
+            }), 200
+
+        except stripe.error.StripeError as e:
+            msg = getattr(e, "user_message", "") or str(e)
+            logger.error(f"Stripe error creating session: {msg}")
+            
+            if isinstance(e, stripe.error.InvalidRequestError):
+                return jsonify({"error": f"Invalid payment request: {msg}"}), 400
+            elif isinstance(e, stripe.error.AuthenticationError):
+                return jsonify({"error": "Payment system authentication failed"}), 500
+            elif isinstance(e, stripe.error.APIConnectionError):
+                return jsonify({"error": "Payment system temporarily unavailable"}), 503
+            else:
+                return jsonify({"error": f"Payment processing failed: {msg}"}), 500
+
+    except Exception as e:
+        logger.error(f"Subscription creation error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Internal server error"}), 500
+
+# -----------------------
+# Enhanced Webhook Handler
+# -----------------------
+@app.post("/api/stripe-webhook")
+def stripe_webhook():
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("Webhook secret not configured")
+        return jsonify({"error": "Webhook secret not configured"}), 500
+
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        logger.info(f"Webhook event received: {event['type']}")
+    except ValueError as e:
+        logger.error(f"Invalid webhook payload: {e}")
+        return jsonify({"error": "Invalid payload"}), 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Invalid webhook signature: {e}")
+        return jsonify({"error": "Invalid signature"}), 400
+
+    try:
+        event_type = event["type"]
+        obj = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            handle_checkout_completed(obj)
+        elif event_type == "invoice.paid":
+            handle_invoice_paid(obj)
+        elif event_type == "customer.subscription.updated":
+            handle_subscription_updated(obj)
+        elif event_type == "customer.subscription.deleted":
+            handle_subscription_deleted(obj)
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Webhook processing failed"}), 500
+
+def handle_checkout_completed(session):
+    """Handle successful checkout completion"""
+    try:
+        customer_id = session.get("customer")
+        user_id = session.get("client_reference_id")
+        
+        if user_id:
+            log_usage(int(user_id), "checkout_completed", {"session_id": session["id"]})
+            
+        logger.info(f"Checkout completed for customer {customer_id}, user {user_id}")
+    except Exception as e:
+        logger.error(f"Error handling checkout completion: {e}")
+
+def handle_invoice_paid(invoice):
+    """Handle successful invoice payment"""
+    try:
+        customer_id = invoice.get("customer")
+        sub_id = invoice.get("subscription")
+        
+        if customer_id and sub_id:
+            subscription = stripe.Subscription.retrieve(sub_id)
+            apply_subscription_state(customer_id, subscription)
+            
+    except Exception as e:
+        logger.error(f"Error handling invoice paid: {e}")
+
+def handle_subscription_updated(subscription):
+    """Handle subscription updates"""
+    try:
+        customer_id = subscription.get("customer")
+        apply_subscription_state(customer_id, subscription)
+    except Exception as e:
+        logger.error(f"Error handling subscription update: {e}")
+
+def handle_subscription_deleted(subscription):
+    """Handle subscription cancellation"""
+    try:
+        customer_id = subscription.get("customer")
+        downgrade_to_free(customer_id)
+    except Exception as e:
+        logger.error(f"Error handling subscription deletion: {e}")
+
+def apply_subscription_state(customer_id: str, subscription: dict):
+    """Apply subscription state to user account"""
+    try:
+        # Get price ID from subscription
+        price_id = subscription["items"]["data"][0]["price"]["id"]
+        plan_name = resolve_plan_by_price_id(price_id)
+
+        if not plan_name:
+            logger.error(f"Unknown price ID in subscription: {price_id}")
+            return
+
+        # Find user by stripe customer ID
+        user = execute_query(
+            "SELECT id FROM users WHERE stripe_customer_id = %s",
+            (customer_id,),
+            fetch_one=True
+        )
+
+        if not user:
+            logger.warning(f"No user found for Stripe customer {customer_id}")
+            return
+
+        user_id = user["id"]
+
+        # Update user subscription
+        current_period_end = subscription.get("current_period_end")
+        reset_date = datetime.utcfromtimestamp(current_period_end) if current_period_end else None
+        
+        update_user_subscription(user_id, plan_name, plans[plan_name]["requests"], reset_date)
+
+        # Update or create subscription record
+        execute_query(
+            """
+            INSERT INTO subscriptions 
+            (user_id, stripe_subscription_id, stripe_customer_id, plan_name, status, 
+             current_period_start, current_period_end)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (stripe_subscription_id) 
+            DO UPDATE SET 
+                plan_name = EXCLUDED.plan_name,
+                status = EXCLUDED.status,
+                current_period_end = EXCLUDED.current_period_end,
+                updated_at = NOW()
+            """,
+            (
+                user_id,
+                subscription["id"],
+                customer_id,
+                plan_name,
+                subscription["status"],
+                datetime.utcfromtimestamp(subscription.get("current_period_start", 0)),
+                reset_date
+            )
+        )
+
+        log_usage(user_id, "subscription_activated", {"plan": plan_name})
+        logger.info(f"User {user_id} upgraded to {plan_name}")
+
+    except Exception as e:
+        logger.error(f"Error applying subscription state: {e}")
+        logger.error(traceback.format_exc())
+
+def downgrade_to_free(customer_id: str):
+    """Downgrade user to free plan"""
+    try:
+        user = execute_query(
+            "SELECT id FROM users WHERE stripe_customer_id = %s",
+            (customer_id,),
+            fetch_one=True
+        )
+
+        if not user:
+            logger.warning(f"No user found for Stripe customer {customer_id}")
+            return
+
+        user_id = user["id"]
+        update_user_subscription(user_id, "free", plans["free"]["requests"])
+        
+        log_usage(user_id, "subscription_cancelled")
+        logger.info(f"User {user_id} downgraded to free plan")
+
+    except Exception as e:
+        logger.error(f"Error downgrading user: {e}")
+
+# -----------------------
+# Enhanced Summarization with better error handling
+# -----------------------
+@app.post("/api/summarize")
+@jwt_required()
+def summarize():
+    try:
+        user_id = get_jwt_identity()
+        user = get_user_by_id(int(user_id))
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        # Check usage limits
+        if user["requests_used"] >= user["request_limit"]:
+            return jsonify({
+                "error": "Request limit reached. Upgrade your plan for more requests.",
+                "upgrade_url": f"{FRONTEND_URL}/upgrade"
+            }), 402
+
+        data = request.get_json() or {}
+        input_text = (data.get("text") or "").strip()
+        
+        if not input_text:
+            return jsonify({"error": "No text provided for summarization"}), 400
+
+        if len(input_text) > 10000:
+            input_text = input_text[:10000] + " [TEXT TRUNCATED]"
+
+        # Create OpenAI prompt
+        prompt = (
+            "Create a dyslexia-friendly summary with these rules:\n"
+            "1. Use ultra-short sentences (max 8 words)\n"
+            "2. Use simple vocabulary (grade 5 level)\n"
+            "3. Break complex ideas into bullet points\n"
+            "4. Avoid metaphors and idioms\n\n"
+            "Text to summarize:\n"
+            f"{input_text}\n\n"
+            "Summary:"
+        )
+
+        MAX_ATTEMPTS = 3
+        SUMMARY_MAX_WORDS = 120
+        READABILITY_THRESHOLD = 85
+
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                resp = openai.ChatCompletion.create(
+                    model="gpt-4o-mini",  # Use more cost-effective model
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.5,
+                    max_tokens=SUMMARY_MAX_WORDS
+                )
+                
+                summary = (resp.choices[0].message.content or "").strip()
+                if not summary:
+                    continue
+
+                # Check readability
+                try:
+                    import textstat
+                    readability = textstat.flesch_reading_ease(summary)
+                except ImportError:
+                    readability = 80  # Default if textstat not available
+
+                # Success criteria
+                if readability >= READABILITY_THRESHOLD or attempt == MAX_ATTEMPTS - 1:
+                    # Increment usage counter
+                    increment_user_requests(int(user_id))
+                    log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
+                    
+                    return jsonify({
+                        "summary_text": summary,
+                        "readability": readability,
+                        "requests_remaining": user["request_limit"] - user["requests_used"] - 1
+                    }), 200
+                
+                time.sleep(1)  # Brief delay between attempts
+                
+            except openai.error.OpenAIError as e:
+                logger.error(f"OpenAI API error: {e}")
+                if attempt == MAX_ATTEMPTS - 1:
+                    return jsonify({"error": "AI service temporarily unavailable"}), 503
+            except Exception as e:
+                logger.error(f"Summarization attempt {attempt + 1} failed: {e}")
+                if attempt == MAX_ATTEMPTS - 1:
+                    return jsonify({"error": "Failed to generate summary"}), 500
+
+        return jsonify({"error": "Failed to generate readable summary"}), 500
+
+    except Exception as e:
+        logger.error(f"Summarization error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Internal server error"}), 500
+
+# -----------------------
+# Enhanced TTS
+# -----------------------
+@app.post("/api/synthesize")
+@jwt_required()
+def synthesize():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json() or {}
+        text = (data.get("text") or "").strip()
+        
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+
+        if not ELEVENLABS_AVAILABLE:
+            return jsonify({"error": "Voice service not available"}), 503
+            
+        if not ELEVENLABS_API_KEY:
+            return jsonify({"error": "Voice service not configured"}), 500
+
+        VOICES = {"encouraging_female": "ZT9u07TYPVl83ejeLakq"}
+        DEFAULT_VOICE = "encouraging_female"
+        MAX_TEXT_LENGTH = 1000
+
+        if len(text) > MAX_TEXT_LENGTH:
+            text = text[:MAX_TEXT_LENGTH]
+
+        try:
+            # Try new SDK pattern first
+            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+            stream = client.text_to_speech.convert(
+                text=text,
+                voice_id=VOICES[DEFAULT_VOICE],
+                model_id="eleven_turbo_v2_5",
+                output_format="mp3_44100_128",
+                voice_settings=VoiceSettings(
+                    stability=0.75, 
+                    similarity_boost=0.75, 
+                    style=0.0, 
+                    use_speaker_boost=True
+                )
+            )
+            audio_bytes = b"".join(stream)
+            
+            log_usage(int(user_id), "tts", {"text_length": len(text)})
+            return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
+            
+        except Exception:
+            # Legacy fallback
+            try:
+                elevenlabs.set_api_key(ELEVENLABS_API_KEY)
+                audio_bytes = elevenlabs.generate(
+                    text=text,
+                    voice=VOICES[DEFAULT_VOICE],
+                    model="eleven_turbo_v2_5"
+                )
+                
+                log_usage(int(user_id), "tts", {"text_length": len(text)})
+                return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
+                
+            except Exception as e:
+                logger.error(f"TTS fallback error: {e}")
+                return jsonify({"error": "Voice generation failed"}), 500
+
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return jsonify({"error": "Voice generation failed"}), 500
+
+# -----------------------
+# Mind Map Storage
+# -----------------------
+@app.post("/api/save-mindmap")
+@jwt_required()
+def save_mindmap():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json() or {}
+        
+        title = data.get("title", "Untitled Mind Map")
+        nodes = data.get("nodes", [])
+        edges = data.get("edges", [])
+        
+        execute_query(
+            """
+            INSERT INTO mindmaps (user_id, title, nodes_data, edges_data)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (int(user_id), title, json.dumps(nodes), json.dumps(edges)),
+            fetch_one=True
+        )
+        
+        log_usage(int(user_id), "mindmap_saved", {"nodes_count": len(nodes)})
+        return jsonify({"message": "Mind map saved successfully"}), 200
+        
+    except Exception as e:
+        logger.error(f"Save mindmap error: {e}")
+        return jsonify({"error": "Failed to save mind map"}), 500
+
+@app.get("/api/mindmaps")
+@jwt_required()
+def get_mindmaps():
+    try:
+        user_id = get_jwt_identity()
+        
+        mindmaps = execute_query(
+            """
+            SELECT id, title, created_at, updated_at
+            FROM mindmaps 
+            WHERE user_id = %s 
+            ORDER BY updated_at DESC
+            """,
+            (int(user_id),),
+            fetch=True
+        )
+        
+        return jsonify({
+            "mindmaps": [
+                {
+                    "id": mm["id"],
+                    "title": mm["title"],
+                    "created_at": mm["created_at"].isoformat(),
+                    "updated_at": mm["updated_at"].isoformat()
+                }
+                for mm in mindmaps
+            ]
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get mindmaps error: {e}")
+        return jsonify({"error": "Failed to fetch mind maps"}), 500
+
+@app.get("/api/mindmap/<int:mindmap_id>")
+@jwt_required()
+def get_mindmap(mindmap_id):
+    try:
+        user_id = get_jwt_identity()
+        
+        mindmap = execute_query(
+            """
+            SELECT nodes_data, edges_data, title
+            FROM mindmaps 
+            WHERE id = %s AND user_id = %s
+            """,
+            (mindmap_id, int(user_id)),
+            fetch_one=True
+        )
+        
+        if not mindmap:
+            return jsonify({"error": "Mind map not found"}), 404
+            
+        return jsonify({
+            "title": mindmap["title"],
+            "nodes": mindmap["nodes_data"],
+            "edges": mindmap["edges_data"]
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get mindmap error: {e}")
+        return jsonify({"error": "Failed to fetch mind map"}), 500
+
+# -----------------------
+# AI Knowledge helpers (unchanged but with error handling)
 # -----------------------
 graph = nx.DiGraph()
 CONCEPTNET_API = "https://api.conceptnet.io/query?node=/c/en/{}&rel=/r/RelatedTo&limit=20"
@@ -129,10 +1061,6 @@ DBPEDIA_API = "http://dbpedia.org/sparql"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 
 concept_relations = {}
-MAX_ATTEMPTS = 5
-SUMMARY_MAX_WORDS = 120
-READABILITY_THRESHOLD = 85
-MAX_TEXT_LENGTH = 1000
 
 def simple_entity_extraction(text):
     entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
@@ -200,487 +1128,124 @@ def expand_concept_dataset(concept):
     concept_relations[concept] = related
     return related
 
-def complete_sentence(text):
-    if not text:
-        return text
-    if re.search(r'[.!?]$', text):
-        return text
-    last_punct = max(text.rfind('.'), text.rfind('!'), text.rfind('?'))
-    if last_punct > 0:
-        return text[:last_punct + 1]
-    return text + '.'
-
-# -----------------------
-# Password hashing
-# -----------------------
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-# -----------------------
-# Health & Root
-# -----------------------
-@app.route("/", methods=["GET", "HEAD"])
-def root():
-    return jsonify(status="ok"), 200
-
-@app.get("/api/health")
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "openai_configured": bool(OPENAI_API_KEY),
-        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
-        "elevenlabs_available": ELEVENLABS_AVAILABLE
-    }), 200
-
-# -----------------------
-# Auth
-# -----------------------
-@app.post("/api/register")
-def register():
-    data = request.get_json() or {}
-    email = data.get("email")
-    password = data.get("password")
-
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
-    if email in users_db:
-        return jsonify({"error": "User already exists"}), 400
-
-    # Create Stripe customer
-    try:
-        customer = stripe.Customer.create(email=email)
-    except stripe.error.StripeError as e:
-        logger.error(f"Stripe error: {e}")
-        return jsonify({"error": "Payment system error"}), 500
-
-    users_db[email] = {
-        "password_hash": hash_password(password),
-        "stripe_customer_id": customer.id,
-        "subscription": "free",
-        "requests_used": 0,
-        "request_limit": plans["free"]["requests"],
-        "reset_date": datetime.utcnow() + timedelta(days=7)
-    }
-    subscriptions_db[customer.id] = "free"
-    return jsonify({"message": "User created"}), 201
-
-@app.post("/api/login")
-def login():
-    data = request.get_json() or {}
-    email = data.get("email")
-    password = data.get("password")
-
-    user = users_db.get(email)
-    if not user or user["password_hash"] != hash_password(password):
-        return jsonify({"error": "Invalid credentials"}), 401
-
-    access_token = create_access_token(identity=email, expires_delta=timedelta(minutes=60))
-    return jsonify(access_token=access_token), 200
-
-@app.get("/api/user")
-@jwt_required()
-def get_user():
-    email = get_jwt_identity()
-    user = users_db.get(email)
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify({
-        "email": email,
-        "subscription": user["subscription"],
-        "requests_used": user["requests_used"],
-        "request_limit": user["request_limit"],
-        "reset_date": user["reset_date"].isoformat()
-    }), 200
-
-# -----------------------
-# Payment Config & Health
-# -----------------------
-@app.get("/api/payment-health")
-def payment_health():
-    status = {
-        "stripe_configured": bool(STRIPE_SECRET_KEY),
-        "webhook_configured": bool(STRIPE_WEBHOOK_SECRET),
-        "price_ids_configured": {
-            "student_inr": bool(plans["LexiSmart Students"]["price_ids"].get("INR")),
-            "pro_inr": bool(plans["LexiSmart Premium"]["price_ids"].get("INR")),
-        },
-        "frontend_url": FRONTEND_URL
-    }
-    try:
-        acct = stripe.Account.retrieve()
-        status["stripe_connection"] = "OK"
-        status["account_country"] = acct.get("country")
-        status["default_currency"] = acct.get("default_currency")
-    except Exception as e:
-        status["stripe_connection"] = f"Error: {e}"
-    return jsonify(status), 200
-
-@app.get("/api/payment-config")
-def payment_config():
-    """
-    Returns live amounts & currency from Stripe for your two INR price IDs.
-    Frontend can render these exactly as billed.
-    """
-    out = {"currency": "INR", "plans": {}}
-    for key in ("LexiSmart Students", "LexiSmart Premium"):
-        pid = plans[key]["price_ids"].get("INR")
-        if not pid:
-            out["plans"][key] = {"amount": None, "interval": "month", "price_id": None}
-            continue
-        try:
-            price = stripe.Price.retrieve(pid)
-            # Stripe returns amount in minor units (paise)
-            amount_major = (price["unit_amount"] or 0) / 100.0
-            interval = price.get("recurring", {}).get("interval", "month")
-            out["plans"][key] = {
-                "amount": amount_major,
-                "interval": interval,
-                "price_id": pid
-            }
-        except Exception as e:
-            logger.error(f"Failed to fetch price {pid}: {e}")
-            out["plans"][key] = {"amount": None, "interval": "month", "price_id": pid}
-    return jsonify(out), 200
-
-# -----------------------
-# Create Subscription (INR)
-# -----------------------
-@app.post("/api/create-subscription")
-@jwt_required()
-def create_subscription():
-    email = get_jwt_identity()
-    user = users_db.get(email)
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    data = request.get_json() or {}
-    plan_input = data.get("plan")  # 'student', 'pro', or product names
-    plan_key = resolve_plan_key(plan_input)
-
-    logger.info(f"Creating subscription for {email}: plan_input={plan_input} -> plan_key={plan_key}")
-    logger.info(f"Available plans: {list(plans.keys())}")
-
-    if plan_key not in plans or plan_key == "free":
-        return jsonify({"error": f"Invalid plan: {plan_input}"}), 400
-
-    price_id = plans[plan_key]["price_ids"].get("INR")
-    if not price_id:
-        return jsonify({"error": f"Price ID (INR) not configured for plan {plan_key}"}), 400
-
-    # Ensure Stripe customer exists/is valid
-    customer_id = user.get("stripe_customer_id")
-    try:
-        stripe.Customer.retrieve(customer_id)
-    except stripe.error.InvalidRequestError:
-        cust = stripe.Customer.create(email=email)
-        customer_id = cust.id
-        user["stripe_customer_id"] = customer_id
-
-    def create_session(pid: str):
-        return stripe.checkout.Session.create(
-            customer=customer_id,
-            mode="subscription",
-            line_items=[{"price": pid, "quantity": 1}],
-            success_url=f"{FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_URL}/cancel",
-            allow_promotion_codes=True,
-            billing_address_collection="required",
-            metadata={"user_email": email, "plan_type": plan_key},
-            client_reference_id=email
-        )
-
-    try:
-        session = create_session(price_id)
-        logger.info(f"Checkout session created: {session.id} (INR)")
-        return jsonify({"sessionId": session.id, "currency_used": "INR"}), 200
-
-    except stripe.error.StripeError as e:
-        msg = getattr(e, "user_message", "") or str(e)
-        logger.error(f"Stripe error: {msg}")
-        if isinstance(e, stripe.error.InvalidRequestError):
-            return jsonify({"error": f"Invalid request: {msg}"}), 400
-        elif isinstance(e, stripe.error.AuthenticationError):
-            return jsonify({"error": "Payment system authentication failed"}), 500
-        elif isinstance(e, stripe.error.APIConnectionError):
-            return jsonify({"error": "Payment system connection failed"}), 503
-        else:
-            return jsonify({"error": f"Payment processing failed: {msg}"}), 500
-    except Exception as e:
-        logger.exception("Unexpected error in subscription creation")
-        return jsonify({"error": "Internal server error"}), 500
-
-# -----------------------
-# Webhook: keep user plan in sync
-# -----------------------
-@app.post("/api/stripe-webhook")
-def stripe_webhook():
-    if not STRIPE_WEBHOOK_SECRET:
-        logger.error("Webhook secret not configured")
-        return jsonify({"error": "Webhook secret not configured"}), 500
-
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        logger.info(f"Webhook event: {event['type']}")
-    except ValueError as e:
-        logger.error(f"Invalid payload: {e}")
-        return jsonify({"error": "Invalid payload"}), 400
-    except stripe.error.SignatureVerificationError as e:
-        logger.error(f"Invalid signature: {e}")
-        return jsonify({"error": "Invalid signature"}), 400
-
-    try:
-        t = event["type"]
-        obj = event["data"]["object"]
-
-        if t == "checkout.session.completed":
-            # You can mark a "pending activation" if needed; subscription changes land on invoice.paid
-            pass
-
-        if t == "invoice.paid":
-            # Subscription is paid and active for the period
-            customer_id = obj.get("customer")
-            sub_id = obj.get("subscription")
-            if customer_id and sub_id:
-                sub = stripe.Subscription.retrieve(sub_id)
-                _apply_subscription_state(customer_id, sub)
-
-        if t == "customer.subscription.updated":
-            sub = obj
-            customer_id = sub.get("customer")
-            _apply_subscription_state(customer_id, sub)
-
-        if t == "customer.subscription.deleted":
-            sub = obj
-            customer_id = sub.get("customer")
-            _downgrade_to_free(customer_id)
-
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.exception(f"Webhook processing error: {e}")
-        return jsonify({"error": "Webhook processing failed"}), 500
-
-def _apply_subscription_state(customer_id: str, subscription: dict):
-    try:
-        price_id = subscription["items"]["data"][0]["price"]["id"]
-        plan_name = resolve_plan_by_price_id(price_id)
-
-        if not plan_name:
-            logger.error(f"Unknown price ID in subscription: {price_id}")
-            return
-
-        # save mapping
-        subscriptions_db[customer_id] = plan_name
-
-        # update user
-        for email, user in users_db.items():
-            if user.get("stripe_customer_id") == customer_id:
-                user["subscription"] = plan_name
-                user["request_limit"] = plans[plan_name]["requests"]
-                user["requests_used"] = 0
-                # use current period end from Stripe if present
-                cpe = subscription.get("current_period_end")
-                if cpe:
-                    user["reset_date"] = datetime.utcfromtimestamp(cpe)
-                else:
-                    user["reset_date"] = datetime.utcnow() + timedelta(days=30)
-                logger.info(f"User {email} upgraded to {plan_name}")
-                break
-        else:
-            logger.warning(f"No local user found for customer {customer_id}")
-    except Exception as e:
-        logger.exception(f"Apply subscription state error: {e}")
-
-def _downgrade_to_free(customer_id: str):
-    subscriptions_db[customer_id] = "free"
-    for email, user in users_db.items():
-        if user.get("stripe_customer_id") == customer_id:
-            user["subscription"] = "free"
-            user["request_limit"] = plans["free"]["requests"]
-            user["requests_used"] = 0
-            user["reset_date"] = datetime.utcnow() + timedelta(days=7)
-            logger.info(f"User {email} downgraded to free")
-            break
-
-# -----------------------
-# Core features
-# -----------------------
-@app.post("/api/summarize")
-@jwt_required()
-def summarize():
-    email = get_jwt_identity()
-    user = users_db.get(email)
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    if user["requests_used"] >= user["request_limit"]:
-        return jsonify({
-            "error": "Request limit reached. Upgrade your plan.",
-            "upgrade_url": f"{FRONTEND_URL}/upgrade"
-        }), 402
-
-    data = request.get_json() or {}
-    input_text = (data.get("text") or "").strip()
-    if not input_text:
-        return jsonify({"error": "No text provided."}), 400
-
-    try:
-        if len(input_text) > 10000:
-            input_text = input_text[:10000] + " [TEXT TRUNCATED]"
-
-        prompt = (
-            "Create a dyslexia-friendly summary with these rules:\n"
-            "1. Use ultra-short sentences (max 8 words)\n"
-            "2. Use simple vocabulary (grade 5 level)\n"
-            "3. Break complex ideas into bullet points\n"
-            "4. Avoid metaphors and idioms\n\n"
-            "Text to summarize:\n"
-            f"{input_text}\n\n"
-            "Summary:"
-        )
-
-        for attempt in range(MAX_ATTEMPTS):
-            try:
-                resp = openai.ChatCompletion.create(
-                    model="gpt-4o",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.5,
-                    max_tokens=SUMMARY_MAX_WORDS
-                )
-                summary = (resp.choices[0].message.content or "").strip()
-                summary = complete_sentence(summary)
-
-                import textstat
-                readability = textstat.flesch_reading_ease(summary)
-
-                # success criteria
-                if readability >= READABILITY_THRESHOLD or attempt == MAX_ATTEMPTS - 1:
-                    user["requests_used"] += 1
-                    return jsonify({
-                        "summary_text": summary,
-                        "readability": readability,
-                        "requests_remaining": user["request_limit"] - user["requests_used"]
-                    }), 200
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"OpenAI error: {e}")
-                return jsonify({"error": f"AI service error: {e}"}), 500
-
-        return jsonify({"error": "Failed to generate readable summary"}), 500
-
-    except Exception as e:
-        logger.exception("Summarization server error")
-        return jsonify({"error": "Internal server error"}), 500
-
-@app.post("/api/synthesize")
-@jwt_required()
-def synthesize():
-    data = request.get_json() or {}
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
-
-    if not ELEVENLABS_AVAILABLE:
-        return jsonify({"error": "Voice service not available"}), 503
-    if not ELEVENLABS_API_KEY:
-        return jsonify({"error": "Voice service not configured"}), 500
-
-    VOICES = {"encouraging_female": "ZT9u07TYPVl83ejeLakq"}
-    DEFAULT_VOICE = "encouraging_female"
-
-    try:
-        if len(text) > MAX_TEXT_LENGTH:
-            text = text[:MAX_TEXT_LENGTH]
-
-        # New SDK pattern
-        try:
-            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-            stream = client.text_to_speech.convert(
-                text=text,
-                voice_id=VOICES[DEFAULT_VOICE],
-                model_id="eleven_turbo_v2_5",
-                output_format="mp3_44100_128",
-                voice_settings=VoiceSettings(
-                    stability=0.75, similarity_boost=0.75, style=0.0, use_speaker_boost=True
-                )
-            )
-            audio_bytes = b"".join(stream)
-            return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
-        except Exception:
-            # Legacy fallback
-            try:
-                elevenlabs.set_api_key(ELEVENLABS_API_KEY)  # type: ignore
-                audio_bytes = elevenlabs.generate(  # type: ignore
-                    text=text,
-                    voice=VOICES[DEFAULT_VOICE],
-                    model="eleven_turbo_v2_5"
-                )
-                return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
-            except Exception as e2:
-                logger.error(f"TTS fallback error: {e2}")
-                return jsonify({"error": "Voice generation failed"}), 500
-
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return jsonify({"error": "Voice generation failed"}), 500
-
-# -----------------------
-# Concept helpers
-# -----------------------
 @app.post("/api/related-concepts")
+@jwt_required()
 def related_concepts():
     try:
+        user_id = get_jwt_identity()
         data = request.get_json() or {}
         concept = (data.get("concept") or "").strip()
+        
         if not concept:
             return jsonify({"error": "No concept provided"}), 400
+            
         related = expand_concept_dataset(concept)[:10]
+        log_usage(int(user_id), "related_concepts", {"concept": concept})
+        
         return jsonify({"concept": concept, "related_concepts": related}), 200
+        
     except Exception as e:
         logger.error(f"Related concepts error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-@app.get("/api/mindmap")
-def get_mindmap():
+@app.get("/api/mindmap-graph")
+def get_mindmap_graph():
     try:
         nodes = [{"id": node} for node in graph.nodes]
         edges = [{"source": s, "target": t} for s, t in graph.edges]
         return jsonify({"nodes": nodes, "edges": edges}), 200
     except Exception as e:
-        logger.error(f"Mindmap error: {e}")
+        logger.error(f"Mindmap graph error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.post("/api/extract-entities")
+@jwt_required()
 def extract_entities():
     try:
+        user_id = get_jwt_identity()
         data = request.get_json() or {}
         text = (data.get("text") or "").strip()
+        
         if not text:
             return jsonify({"error": "No text provided"}), 400
+            
         entities = simple_entity_extraction(text)
+        log_usage(int(user_id), "entity_extraction", {"entities_count": len(entities)})
+        
         return jsonify({"entities": entities}), 200
+        
     except Exception as e:
         logger.error(f"Entity extraction error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 # -----------------------
-# Startup Env Validation
+# Analytics endpoint
+# -----------------------
+@app.get("/api/analytics")
+@jwt_required()
+def get_analytics():
+    try:
+        user_id = get_jwt_identity()
+        
+        # Get usage stats for the user
+        stats = execute_query(
+            """
+            SELECT 
+                action_type,
+                COUNT(*) as count,
+                DATE(created_at) as date
+            FROM usage_analytics 
+            WHERE user_id = %s 
+                AND created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY action_type, DATE(created_at)
+            ORDER BY date DESC
+            """,
+            (int(user_id),),
+            fetch=True
+        )
+        
+        return jsonify({"usage_stats": [
+            {
+                "action": stat["action_type"],
+                "count": stat["count"],
+                "date": stat["date"].isoformat()
+            }
+            for stat in stats
+        ]}), 200
+        
+    except Exception as e:
+        logger.error(f"Analytics error: {e}")
+        return jsonify({"error": "Failed to fetch analytics"}), 500
+
+# -----------------------
+# Environment Validation
 # -----------------------
 def validate_environment() -> bool:
+    """Validate required environment variables"""
     required = {
+        "DATABASE_URL": DATABASE_URL,
         "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
         "PRICE_ID_STUDENT_INR": plans["LexiSmart Students"]["price_ids"].get("INR"),
         "PRICE_ID_PRO_INR": plans["LexiSmart Premium"]["price_ids"].get("INR"),
         "FRONTEND_URL": FRONTEND_URL,
         "JWT_SECRET": os.getenv("JWT_SECRET"),
+        "OPENAI_API_KEY": OPENAI_API_KEY
     }
+    
     missing = [k for k, v in required.items() if not v]
     if missing:
         logger.error(f"Missing required environment variables: {missing}")
         return False
+    
+    # Test database connection
+    try:
+        execute_query("SELECT 1", fetch_one=True)
+        logger.info("Database connection validated")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        return False
+    
+    # Test Stripe API
     try:
         stripe.Account.retrieve()
         logger.info("Stripe API key validated")
@@ -690,14 +1255,33 @@ def validate_environment() -> bool:
     except Exception as e:
         logger.error(f"Stripe validation error: {e}")
         return False
+    
     return True
 
+# -----------------------
+# Application Startup
+# -----------------------
 if __name__ in ("__main__", "app"):
-    if not validate_environment():
-        logger.error("Environment validation failed. Please check your configuration.")
+    try:
+        if not validate_environment():
+            logger.error("Environment validation failed. Please check your configuration.")
+            exit(1)
+        
+        # Initialize database tables
+        init_database()
+        logger.info("Database initialized successfully")
+        
+        logger.info("LexiSmart backend started successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        logger.error(traceback.format_exc())
+        exit(1)
 
 # -----------------------
-# Local run
+# Local Development
 # -----------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    port = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_ENV") == "development"
+    app.run(host="0.0.0.0", port=port, debug=debug)
