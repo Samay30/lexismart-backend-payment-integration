@@ -405,6 +405,51 @@ def register():
         logger.error(traceback.format_exc())
         return jsonify({"error": "Registration failed. Please try again later."}), 500
 
+# NEW: GET /api/register to mirror POST (supports current frontend GET usage)
+@app.get("/api/register")
+def register_get():
+    try:
+        email = (request.args.get("email") or "").strip().lower()
+        password = (request.args.get("password") or "").strip()
+
+        # Validation
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+        
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters long"}), 400
+        
+        if "@" not in email or "." not in email:
+            return jsonify({"error": "Please enter a valid email address"}), 400
+
+        # Check if user already exists
+        existing_user = get_user_by_email(email)
+        if existing_user:
+            return jsonify({"error": "An account with this email already exists"}), 400
+
+        # Create Stripe customer (best-effort)
+        stripe_customer_id = None
+        try:
+            customer = stripe.Customer.create(email=email)
+            stripe_customer_id = customer.id
+            logger.info(f"[GET] Created Stripe customer {stripe_customer_id} for {email}")
+        except stripe.error.StripeError as e:
+            logger.error(f"[GET] Stripe customer creation failed: {e}")
+
+        # Create user
+        password_hash = hash_password(password)
+        user_result = create_user(email, password_hash, stripe_customer_id)
+        if not user_result:
+            return jsonify({"error": "Failed to create user account"}), 500
+
+        logger.info(f"[GET] User registered successfully: {email}")
+        return jsonify({"message": "Account created successfully! Please login."}), 201
+
+    except Exception as e:
+        logger.error(f"Registration error (GET): {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Registration failed. Please try again later."}), 500
+
 @app.post("/api/login")
 def login():
     try:
@@ -800,22 +845,9 @@ def downgrade_to_free(customer_id: str):
 # Enhanced Summarization with better error handling
 # -----------------------
 @app.post("/api/summarize")
-@jwt_required()
+@jwt_required(optional=True)  # made optional so guests can summarize
 def summarize():
     try:
-        user_id = get_jwt_identity()
-        user = get_user_by_id(int(user_id))
-        
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-
-        # Check usage limits
-        if user["requests_used"] >= user["request_limit"]:
-            return jsonify({
-                "error": "Request limit reached. Upgrade your plan for more requests.",
-                "upgrade_url": f"{FRONTEND_URL}/upgrade"
-            }), 402
-
         data = request.get_json() or {}
         input_text = (data.get("text") or "").strip()
         
@@ -824,6 +856,19 @@ def summarize():
 
         if len(input_text) > 10000:
             input_text = input_text[:10000] + " [TEXT TRUNCATED]"
+
+        # determine auth state
+        user_id = get_jwt_identity()  # None if not logged in
+        if user_id:
+            user = get_user_by_id(int(user_id))
+            if not user:
+                return jsonify({"error": "User not found"}), 404
+            # Check usage limits only for authenticated users
+            if user["requests_used"] >= user["request_limit"]:
+                return jsonify({
+                    "error": "Request limit reached. Upgrade your plan for more requests.",
+                    "upgrade_url": f"{FRONTEND_URL}/upgrade"
+                }), 402
 
         # Create OpenAI prompt
         prompt = (
@@ -863,14 +908,22 @@ def summarize():
 
                 # Success criteria
                 if readability >= READABILITY_THRESHOLD or attempt == MAX_ATTEMPTS - 1:
-                    # Increment usage counter
-                    increment_user_requests(int(user_id))
-                    log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
+                    # Increment usage counter & log only if authenticated
+                    if user_id:
+                        increment_user_requests(int(user_id))
+                        log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
                     
+                    remaining = None
+                    if user_id:
+                        # fetch fresh count if you want exact remaining
+                        # here we subtract one optimistically
+                        user = get_user_by_id(int(user_id))
+                        remaining = (user["request_limit"] - user["requests_used"]) if user else None
+
                     return jsonify({
                         "summary_text": summary,
                         "readability": readability,
-                        "requests_remaining": user["request_limit"] - user["requests_used"] - 1
+                        "requests_remaining": remaining
                     }), 200
                 
                 time.sleep(1)  # Brief delay between attempts
