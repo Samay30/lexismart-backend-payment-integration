@@ -10,7 +10,23 @@ import textstat
 import openai
 import time
 import re
-from elevenlabs import ElevenLabs, VoiceSettings
+# Try different ElevenLabs import patterns for compatibility
+try:
+    from elevenlabs import ElevenLabs, VoiceSettings
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    try:
+        from elevenlabs.client import ElevenLabs
+        from elevenlabs import VoiceSettings
+        ELEVENLABS_AVAILABLE = True
+    except ImportError:
+        try:
+            import elevenlabs
+            ELEVENLABS_AVAILABLE = True
+            # We'll handle this in the synthesis function
+        except ImportError:
+            ELEVENLABS_AVAILABLE = False
+            logger.warning("ElevenLabs not available")
 import tempfile
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 import stripe
@@ -289,6 +305,9 @@ def synthesize():
     if not text:
         return jsonify({"error": "No text provided"}), 400
     
+    if not ELEVENLABS_AVAILABLE:
+        return jsonify({"error": "Voice service not available"}), 503
+        
     if not ELEVENLABS_API_KEY:
         return jsonify({"error": "Voice service not configured"}), 500
     
@@ -297,19 +316,36 @@ def synthesize():
         if len(text) > MAX_TEXT_LENGTH:
             text = text[:MAX_TEXT_LENGTH]
         
-        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-        audio_stream = client.text_to_speech.convert(
-            text=text,
-            voice_id=VOICES[DEFAULT_VOICE],
-            model_id="eleven_turbo_v2_5",
-            output_format="mp3_44100_128",
-            voice_settings=VoiceSettings(
-                stability=0.75,
-                similarity_boost=0.75,
-                style=0.0,
-                use_speaker_boost=True
+        # Try different ElevenLabs API patterns
+        try:
+            # New API pattern
+            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+            audio_stream = client.text_to_speech.convert(
+                text=text,
+                voice_id=VOICES[DEFAULT_VOICE],
+                model_id="eleven_turbo_v2_5",
+                output_format="mp3_44100_128",
+                voice_settings=VoiceSettings(
+                    stability=0.75,
+                    similarity_boost=0.75,
+                    style=0.0,
+                    use_speaker_boost=True
+                )
             )
-        )
+        except (AttributeError, NameError):
+            # Fallback to older API pattern
+            import elevenlabs
+            elevenlabs.set_api_key(ELEVENLABS_API_KEY)
+            audio_bytes = elevenlabs.generate(
+                text=text,
+                voice=VOICES[DEFAULT_VOICE],
+                model="eleven_turbo_v2_5"
+            )
+            return send_file(
+                io.BytesIO(audio_bytes),
+                mimetype='audio/mpeg',
+                as_attachment=False
+            )
 
         # Stream audio directly without temp file
         audio_bytes = b"".join(audio_stream)
@@ -439,7 +475,8 @@ def health_check():
         "status": "healthy",
         "spacy_available": False,
         "openai_configured": bool(openai.api_key),
-        "elevenlabs_configured": bool(ELEVENLABS_API_KEY)
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
+        "elevenlabs_available": ELEVENLABS_AVAILABLE
     })
 
 if __name__ == '__main__':
