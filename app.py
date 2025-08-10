@@ -235,23 +235,23 @@ plans = {
         "requests": 5,
         "price_ids": {}
     },
-    "LexiSmart Students": {
+    "Student": {
         "requests": 200,
         "price_ids": {
-            "INR": os.getenv("PRICE_ID_STUDENT_INR")
+            "USD": os.getenv("PRICE_ID_STUDENT_INR")
         }
     },
-    "LexiSmart Premium": {
+    "Pro": {
         "requests": 10000,
         "price_ids": {
-            "INR": os.getenv("PRICE_ID_PRO_INR")
+            "USD": os.getenv("PRICE_ID_PRO_INR")
         }
     }
 }
 
 PLAN_ALIASES = {
-    "student": "LexiSmart Students",
-    "pro": "LexiSmart Premium",
+    "student": "Student",
+    "pro": "Pro",
 }
 
 def resolve_plan_key(plan_type: str) -> str:
@@ -461,8 +461,8 @@ def payment_health():
         "stripe_configured": bool(STRIPE_SECRET_KEY),
         "webhook_configured": bool(STRIPE_WEBHOOK_SECRET),
         "price_ids_configured": {
-            "student_inr": bool(plans["LexiSmart Students"]["price_ids"].get("USD")),
-            "pro_inr": bool(plans["LexiSmart Premium"]["price_ids"].get("USD")),
+            "student_inr": bool(plans["Student"]["price_ids"].get("USD")),
+            "pro_inr": bool(plans["Pro"]["price_ids"].get("USD")),
         },
         "frontend_url": FRONTEND_URL
     }
@@ -482,8 +482,8 @@ def payment_health():
 
 @app.get("/api/payment-config")
 def payment_config():
-    out = {"currency": "INR", "plans": {}}
-    for key in ("LexiSmart Students", "LexiSmart Premium"):
+    out = {"currency": "USD", "plans": {}}
+    for key in ("Student", "Pro"):
         pid = plans[key]["price_ids"].get("INR")
         if not pid:
             out["plans"][key] = {"amount": None, "interval": "month", "price_id": None}
