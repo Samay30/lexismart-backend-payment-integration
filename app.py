@@ -729,25 +729,259 @@ def downgrade_to_free(customer_id: str):
         logger.error(f"Error downgrading user: {e}")
 
 # Summarization endpoint (GET + POST)
+import re
+import time
+import logging
+from typing import Dict, List, Tuple, Optional
+from flask import jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+
+# Add these imports to your existing imports
+try:
+    import textstat
+    from rouge_score import rouge_scorer
+    TEXTSTAT_AVAILABLE = True
+    ROUGE_AVAILABLE = True
+except ImportError:
+    TEXTSTAT_AVAILABLE = False
+    ROUGE_AVAILABLE = False
+    logging.warning("textstat and/or rouge-score not available. Install with: pip install textstat rouge-score")
+
+# Enhanced configuration class
+class DyslexiaConfig:
+    # Controller loop settings
+    CONTROLLER_MAX_TRIES = 4
+    
+    # Readability targets (more aggressive than research version)
+    TARGET_FRE_MIN = 85.0  # Flesch Reading Ease minimum
+    TARGET_AVG_SENTLEN_MAX = 6.0  # Average sentence length maximum
+    TARGET_SYLL_PER_WORD_MAX = 1.3  # Syllables per word maximum
+    
+    # Semantic quality floor
+    MIN_ROUGE_L = 0.16  # Minimum ROUGE-L score vs original
+    
+    # Balance scoring weights
+    BALANCE_W_READABILITY = 0.6  # Prioritize readability more
+    BALANCE_W_SEMANTICS = 0.4
+    
+    # API settings
+    SUMMARY_MAX_WORDS = 120
+    REQUEST_DELAY = 0.5  # Delay between attempts
+
+
+class EnhancedEvaluator:
+    """Enhanced readability and semantic evaluation"""
+    
+    def __init__(self):
+        self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True) if ROUGE_AVAILABLE else None
+    
+    @staticmethod
+    def split_sentences(text: str) -> List[str]:
+        """Lightweight sentence splitting"""
+        if not text or not text.strip():
+            return []
+        parts = [s.strip() for s in re.split(r'[.!?]+\s+', text) if s.strip()]
+        return parts if parts else [text.strip()]
+    
+    def calculate_readability(self, text: str) -> Dict[str, float]:
+        """Calculate comprehensive readability metrics"""
+        if not text or not text.strip():
+            return {
+                'flesch_reading_ease': 0.0,
+                'avg_sentence_length': 0.0,
+                'syllable_density': 0.0,
+                'short_word_ratio': 0.0,
+                'total_words': 0,
+                'total_sentences': 0,
+            }
+        
+        words = text.split()
+        sentences = self.split_sentences(text)
+        total_words = len(words)
+        total_sentences = max(1, len(sentences))
+        
+        # Calculate metrics with fallbacks
+        if TEXTSTAT_AVAILABLE:
+            try:
+                fre = textstat.flesch_reading_ease(text)
+                syllables = textstat.syllable_count(text)
+            except:
+                fre = self._calculate_fre_fallback(text, words, sentences)
+                syllables = self._count_syllables_fallback(words)
+        else:
+            fre = self._calculate_fre_fallback(text, words, sentences)
+            syllables = self._count_syllables_fallback(words)
+        
+        avg_sentence_length = total_words / total_sentences
+        syllable_density = syllables / total_words if total_words > 0 else 0.0
+        
+        # Count short words (≤ 2 syllables)
+        short_words = 0
+        for word in words:
+            if TEXTSTAT_AVAILABLE:
+                try:
+                    if textstat.syllable_count(word) <= 2:
+                        short_words += 1
+                except:
+                    if self._count_word_syllables(word) <= 2:
+                        short_words += 1
+            else:
+                if self._count_word_syllables(word) <= 2:
+                    short_words += 1
+        
+        short_word_ratio = short_words / total_words if total_words > 0 else 0.0
+        
+        return {
+            'flesch_reading_ease': fre,
+            'avg_sentence_length': avg_sentence_length,
+            'syllable_density': syllable_density,
+            'short_word_ratio': short_word_ratio,
+            'total_words': total_words,
+            'total_sentences': total_sentences,
+        }
+    
+    def _calculate_fre_fallback(self, text: str, words: List[str], sentences: List[str]) -> float:
+        """Fallback FRE calculation"""
+        total_words = len(words)
+        total_sentences = max(1, len(sentences))
+        syllables = self._count_syllables_fallback(words)
+        
+        if total_words == 0:
+            return 0.0
+            
+        avg_sentence_length = total_words / total_sentences
+        avg_syllables_per_word = syllables / total_words
+        
+        return 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
+    
+    def _count_syllables_fallback(self, words: List[str]) -> int:
+        """Simple syllable counting fallback"""
+        return sum(self._count_word_syllables(word) for word in words)
+    
+    def _count_word_syllables(self, word: str) -> int:
+        """Count syllables in a word using vowel groups"""
+        word = word.lower().strip()
+        if not word:
+            return 0
+        
+        vowels = 'aeiouy'
+        syllable_count = 0
+        prev_was_vowel = False
+        
+        for char in word:
+            if char in vowels:
+                if not prev_was_vowel:
+                    syllable_count += 1
+                prev_was_vowel = True
+            else:
+                prev_was_vowel = False
+        
+        # Handle silent e
+        if word.endswith('e') and syllable_count > 1:
+            syllable_count -= 1
+        
+        return max(1, syllable_count)
+    
+    def calculate_rouge_l(self, summary: str, original: str) -> float:
+        """Calculate ROUGE-L score"""
+        if not self.rouge_scorer or not summary or not original:
+            return 0.0
+        
+        try:
+            score = self.rouge_scorer.score(original, summary)
+            return score["rougeL"].fmeasure
+        except:
+            return 0.0
+
+
+def meets_dyslexia_targets(readability: Dict[str, float], rouge_l: float) -> bool:
+    """Check if summary meets dyslexia-friendly targets"""
+    return (
+        readability['flesch_reading_ease'] >= DyslexiaConfig.TARGET_FRE_MIN and
+        readability['avg_sentence_length'] <= DyslexiaConfig.TARGET_AVG_SENTLEN_MAX and
+        readability['syllable_density'] <= DyslexiaConfig.TARGET_SYLL_PER_WORD_MAX and
+        rouge_l >= DyslexiaConfig.MIN_ROUGE_L
+    )
+
+
+def calculate_balance_score(readability: Dict[str, float], rouge_l: float) -> float:
+    """Calculate balanced readability-semantics score"""
+    fre = readability['flesch_reading_ease']
+    semantics_scaled = 100.0 * rouge_l  # Scale ROUGE to 0-100
+    
+    return (
+        DyslexiaConfig.BALANCE_W_READABILITY * fre + 
+        DyslexiaConfig.BALANCE_W_SEMANTICS * semantics_scaled
+    )
+
+
+def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
+    """Create increasingly aggressive prompts for dyslexia-friendly summaries"""
+    base_instructions = [
+        # Attempt 0: Moderate approach
+        (
+            "Create a clear, easy-to-read summary for people with dyslexia:\n"
+            "- Keep sentences short (4-7 words)\n"
+            "- Use simple, common words\n"
+            "- Break into bullet points or short paragraphs\n"
+            "- Use active voice and present tense\n"
+            "- Focus on the most important facts\n\n"
+        ),
+        # Attempt 1: More aggressive
+        (
+            "Create an EXTREMELY simple summary for dyslexic readers:\n"
+            "- Maximum 5 words per sentence\n"
+            "- Use only basic vocabulary (elementary level)\n"
+            "- Replace complex words with simple ones\n"
+            "- Use numbered points for each main idea\n"
+            "- Avoid all commas - use periods instead\n\n"
+        ),
+        # Attempt 2: Very aggressive
+        (
+            "Create a summary using ONLY simple, everyday words:\n"
+            "- Sentences: 3-5 words maximum\n"
+            "- No words over 2 syllables\n"
+            "- Use bullet points for each fact\n"
+            "- Repeat key words for clarity\n"
+            "- Elementary school reading level\n\n"
+        ),
+        # Attempt 3: Ultra simple
+        (
+            "Create an ULTRA-simple summary for severe reading difficulties:\n"
+            "- Each sentence: 3-4 words only\n"
+            "- No complex words at all\n"
+            "- Very short bullet points\n"
+            "- Simple story flow\n"
+            "- First grade level\n\n"
+        )
+    ]
+    
+    instruction = base_instructions[min(attempt, len(base_instructions) - 1)]
+    return f"{instruction}Text to summarize: {text[:1500]}\n\nSimple summary:"
+
+
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
 def summarize():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
+    
     try:
-        
+        # Get input text
         if request.method == "GET":
             input_text = (request.args.get("text") or "").strip()
         else:
             data = request.get_json() or {}
             input_text = (data.get("text") or "").strip()
-
+        
         if not input_text:
             return jsonify({"error": "No text provided for summarization"}), 400
+        
         if len(input_text) > 10000:
             input_text = input_text[:10000] + " [TEXT TRUNCATED]"
-
-        user_id = get_jwt_identity()  # None if not logged in
+        
+        # User authentication and limits
+        user_id = get_jwt_identity()
         if user_id:
             user = get_user_by_id(int(user_id))
             if not user:
@@ -757,64 +991,136 @@ def summarize():
                     "error": "Request limit reached. Upgrade your plan for more requests.",
                     "upgrade_url": f"{FRONTEND_URL}/upgrade"
                 }), 402
-
-        prompt = (
-            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
-            "- Keep sentences 4–8 words\n"
-            "- Prefer one-syllable words\n"
-            "- Use bullets or numbered points\n"
-            "- Simple present tense\n"
-            "- Keep key facts\n\n"
-            f"Article: {input_text}\n\nSimple summary:"
-            "Summary:"
-        )
-        MAX_ATTEMPTS = 3
-        SUMMARY_MAX_WORDS = 120
-        READABILITY_THRESHOLD = 85
-        for attempt in range(MAX_ATTEMPTS):
+        
+        # Initialize evaluator
+        evaluator = EnhancedEvaluator()
+        
+        # Controller loop: Try multiple approaches to hit targets
+        best_summary = None
+        best_score = -float('inf')
+        target_hit = False
+        
+        for attempt in range(DyslexiaConfig.CONTROLLER_MAX_TRIES):
             try:
+                # Create prompt with increasing aggressiveness
+                prompt = create_dyslexia_prompt(input_text, attempt)
+                
+                # Generate summary
                 resp = openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.5,
-                    max_tokens=SUMMARY_MAX_WORDS
+                    max_tokens=DyslexiaConfig.SUMMARY_MAX_WORDS
                 )
+                
                 summary = (resp.choices[0].message.content or "").strip()
                 if not summary:
                     continue
-                try:
-                    import textstat
-                    readability = textstat.flesch_reading_ease(summary)
-                except ImportError:
-                    readability = 80
-                if readability >= READABILITY_THRESHOLD or attempt == MAX_ATTEMPTS - 1:
-                    if user_id:
-                        increment_user_requests(int(user_id))
-                        log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
-                    remaining = None
-                    if user_id:
-                        user = get_user_by_id(int(user_id))
-                        remaining = user["request_limit"] - user["requests_used"] if user else None
-                    return jsonify({
-                        "summary_text": summary,
-                        "readability": readability,
-                        "requests_remaining": remaining
-                    }), 200
-                time.sleep(1)
+                
+                # Evaluate summary
+                readability = evaluator.calculate_readability(summary)
+                rouge_l = evaluator.calculate_rouge_l(summary, input_text)
+                
+                # Check if targets are met
+                if meets_dyslexia_targets(readability, rouge_l):
+                    target_hit = True
+                    best_summary = summary
+                    best_readability = readability
+                    best_rouge = rouge_l
+                    break
+                
+                # Calculate balance score for ranking
+                balance = calculate_balance_score(readability, rouge_l)
+                if balance > best_score:
+                    best_score = balance
+                    best_summary = summary
+                    best_readability = readability
+                    best_rouge = rouge_l
+                
+                # Add delay between attempts
+                if attempt < DyslexiaConfig.CONTROLLER_MAX_TRIES - 1:
+                    time.sleep(DyslexiaConfig.REQUEST_DELAY)
+                    
             except openai.error.OpenAIError as e:
-                logger.error(f"OpenAI API error: {e}")
-                if attempt == MAX_ATTEMPTS - 1:
+                logger.error(f"OpenAI API error on attempt {attempt + 1}: {e}")
+                if attempt == DyslexiaConfig.CONTROLLER_MAX_TRIES - 1:
                     return jsonify({"error": "AI service temporarily unavailable"}), 503
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
             except Exception as e:
-                logger.error(f"Summarization attempt {attempt + 1} failed: {e}")
-                if attempt == MAX_ATTEMPTS - 1:
-                    return jsonify({"error": "Failed to generate summary"}), 500
-        return jsonify({"error": "Failed to generate readable summary"}), 500
+                logger.error(f"Summary generation attempt {attempt + 1} failed: {e}")
+                if attempt == DyslexiaConfig.CONTROLLER_MAX_TRIES - 1:
+                    break
+        
+        # Check if we got any summary
+        if not best_summary:
+            return jsonify({"error": "Failed to generate summary"}), 500
+        
+        # Update user request count and log usage
+        if user_id:
+            increment_user_requests(int(user_id))
+            log_usage(int(user_id), "summarize", {
+                "text_length": len(input_text),
+                "target_hit": target_hit,
+                "attempts_used": attempt + 1
+            })
+        
+        # Calculate remaining requests
+        remaining = None
+        if user_id:
+            user = get_user_by_id(int(user_id))
+            remaining = user["request_limit"] - user["requests_used"] if user else None
+        
+        # Return enhanced response
+        response_data = {
+            "summary_text": best_summary,
+            "readability_score": round(best_readability['flesch_reading_ease'], 1),
+            "avg_sentence_length": round(best_readability['avg_sentence_length'], 1),
+            "syllable_density": round(best_readability['syllable_density'], 2),
+            "semantic_quality": round(best_rouge * 100, 1),  # Convert to percentage
+            "targets_met": target_hit,
+            "requests_remaining": remaining,
+            "quality_metrics": {
+                "total_words": best_readability['total_words'],
+                "total_sentences": best_readability['total_sentences'],
+                "short_word_ratio": round(best_readability['short_word_ratio'], 2)
+            }
+        }
+        
+        return jsonify(response_data), 200
+        
     except Exception as e:
         logger.error(f"Summarization error: {e}")
         logger.error(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
 
+
+# Optional: Add a configuration endpoint for admins
+@app.route("/api/admin/dyslexia-config", methods=["GET", "POST"])
+@jwt_required()
+def dyslexia_config():
+    """Admin endpoint to view/update dyslexia summarization settings"""
+    user_id = get_jwt_identity()
+    user = get_user_by_id(int(user_id))
+    
+    if not user or user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    
+    if request.method == "GET":
+        return jsonify({
+            "controller_max_tries": DyslexiaConfig.CONTROLLER_MAX_TRIES,
+            "target_fre_min": DyslexiaConfig.TARGET_FRE_MIN,
+            "target_avg_sentlen_max": DyslexiaConfig.TARGET_AVG_SENTLEN_MAX,
+            "target_syll_per_word_max": DyslexiaConfig.TARGET_SYLL_PER_WORD_MAX,
+            "min_rouge_l": DyslexiaConfig.MIN_ROUGE_L,
+            "balance_w_readability": DyslexiaConfig.BALANCE_W_READABILITY,
+            "balance_w_semantics": DyslexiaConfig.BALANCE_W_SEMANTICS
+        })
+    
+    # POST: Update configuration (implement as needed)
+    data = request.get_json() or {}
+    # Add validation and update logic here
+    return jsonify({"status": "Configuration updated"})
 # TTS endpoint
 @app.post("/api/synthesize")
 @jwt_required()
