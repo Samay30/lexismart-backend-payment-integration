@@ -1139,8 +1139,8 @@ def validate_environment() -> bool:
     required = {
         "DATABASE_URL": DATABASE_URL,
         "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
-        "PRICE_ID_STUDENT_INR": plans["LexiSmart Students"]["price_ids"].get("INR"),
-        "PRICE_ID_PRO_INR": plans["LexiSmart Premium"]["price_ids"].get("INR"),
+        "PRICE_ID_STUDENT_INR": plans["Student"]["price_ids"].get("USD"),
+        "PRICE_ID_PRO_INR": plans["Pro"]["price_ids"].get("USD"),
         "FRONTEND_URL": FRONTEND_URL,
         "JWT_SECRET": os.getenv("JWT_SECRET"),
         "OPENAI_API_KEY": OPENAI_API_KEY
