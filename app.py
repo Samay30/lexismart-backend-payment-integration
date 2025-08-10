@@ -174,17 +174,19 @@ def init_database():
 # Flask app & CORS
 # -----------------------
 app = Flask(__name__)
-
 # Get allowed origins from environment or use defaults
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
 if not allowed_origins or allowed_origins[0] == "":
     allowed_origins = [
         FRONTEND_URL, 
-        "https://*.netlify.app",
+        "https://*.netlify.app",  # Wildcard for Netlify
         "http://localhost:3000",
         "http://127.0.0.1:3000"
     ]
+
+# Add this to log CORS configuration
+logger.info(f"Allowed CORS origins: {allowed_origins}")
 
 CORS(
     app,
@@ -727,10 +729,13 @@ def downgrade_to_free(customer_id: str):
         logger.error(f"Error downgrading user: {e}")
 
 # Summarization endpoint (GET + POST)
-@app.route("/api/summarize", methods=["GET", "POST"])
+@app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
 def summarize():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     try:
+        
         if request.method == "GET":
             input_text = (request.args.get("text") or "").strip()
         else:
