@@ -975,6 +975,109 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
     return f"{instruction}Article: {text[:1500]}\n\nFun summary:"
 
 # ... (previous imports and config classes) ...
+class NarrativeEvaluator:
+    """Base evaluator with shared methods"""
+    
+    def __init__(self):
+        try:
+            from rouge_score import rouge_scorer
+            self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        except ImportError:
+            self.rouge_scorer = None
+        
+        # Coherence indicators
+        self.causal_words = {'because', 'since', 'so', 'therefore', 'thus', 'as a result'}
+        self.temporal_words = {'first', 'then', 'next', 'after', 'before', 'finally', 'now'}
+        self.contrast_words = {'but', 'however', 'although', 'despite', 'actually', 'in reality'}
+        self.question_words = {'who', 'what', 'where', 'when', 'why', 'how', '?'}
+        
+        self.narrative_connectors = self.causal_words | self.temporal_words | self.contrast_words
+    
+    @staticmethod
+    def split_sentences(text: str) -> list[str]:
+        """Lightweight sentence splitting"""
+        if not text or not text.strip():
+            return []
+        parts = [s.strip() for s in re.split(r'[.!?]+\s+', text) if s.strip()]
+        return parts if parts else [text.strip()]
+    
+    def calculate_readability(self, text: str) -> dict[str, float]:
+        """Calculate readability metrics"""
+        # ... (implementation from original NarrativeEvaluator) ...
+        if not text or not text.strip():
+            return {
+                'flesch_reading_ease': 0.0,
+                'avg_sentence_length': 0.0,
+                'syllable_density': 0.0,
+                'short_word_ratio': 0.0,
+                'total_words': 0,
+                'total_sentences': 0,
+            }
+        
+        words = text.split()
+        sentences = self.split_sentences(text)
+        total_words = len(words)
+        total_sentences = max(1, len(sentences))
+        
+        # Simple syllable counting
+        syllables = sum(self._count_word_syllables(word) for word in words)
+        
+        # Calculate FRE
+        if total_words == 0:
+            fre = 0.0
+        else:
+            avg_sentence_length = total_words / total_sentences
+            avg_syllables_per_word = syllables / total_words
+            fre = 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
+        
+        avg_sentence_length = total_words / total_sentences
+        syllable_density = syllables / total_words if total_words > 0 else 0.0
+        
+        # Count short words
+        short_words = sum(1 for word in words if self._count_word_syllables(word) <= 2)
+        short_word_ratio = short_words / total_words if total_words > 0 else 0.0
+        
+        return {
+            'flesch_reading_ease': fre,
+            'avg_sentence_length': avg_sentence_length,
+            'syllable_density': syllable_density,
+            'short_word_ratio': short_word_ratio,
+            'total_words': total_words,
+            'total_sentences': total_sentences,
+        }
+    
+    def _count_word_syllables(self, word: str) -> int:
+        """Count syllables in a word"""
+        word = word.lower().strip()
+        if not word:
+            return 0
+        
+        vowels = 'aeiouy'
+        syllable_count = 0
+        prev_was_vowel = False
+        
+        for char in word:
+            if char in vowels:
+                if not prev_was_vowel:
+                    syllable_count += 1
+                prev_was_vowel = True
+            else:
+                prev_was_vowel = False
+        
+        if word.endswith('e') and syllable_count > 1:
+            syllable_count -= 1
+        
+        return max(1, syllable_count)
+    
+    def calculate_rouge_l(self, summary: str, original: str) -> float:
+        """Calculate ROUGE-L score"""
+        if not self.rouge_scorer or not summary or not original:
+            return 0.0
+        try:
+            score = self.rouge_scorer.score(original, summary)
+            return score["rougeL"].fmeasure
+        except:
+            return 0.0
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
