@@ -13,7 +13,7 @@ stripe==6.6.0
 openai==0.28.0
 
 # Audio/TTS - Make elevenlabs optional for deployment
-# elevenlabs==0.2.26
+elevenlabs==0.2.26
 
 # Graph/Network analysis
 networkx==3.1
