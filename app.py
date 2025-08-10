@@ -854,7 +854,7 @@ class DyslexiaFriendlyEvaluator:
             text = re.sub(pattern, f"\\g<0> {emoji}", text, flags=re.IGNORECASE)
         return text
 
-    def calculate_narrative_coherence(self, text: str) -> Dict[str, float]:
+    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
         """Calculate narrative coherence metrics with engagement focus"""
         # ... (same as before but add question detection) ...
         if not text:
