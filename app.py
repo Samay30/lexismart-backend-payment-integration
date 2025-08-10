@@ -759,13 +759,13 @@ def summarize():
                 }), 402
 
         prompt = (
-            "Create a dyslexia-friendly summary with these rules:\n"
-            "1. Use ultra-short sentences (max 8 words)\n"
-            "2. Use simple vocabulary (grade 5 level)\n"
-            "3. Break complex ideas into bullet points\n"
-            "4. Avoid metaphors and idioms\n\n"
-            "Text to summarize:\n"
-            f"{input_text}\n\n"
+            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
+            "- Keep sentences 4–8 words\n"
+            "- Prefer one-syllable words\n"
+            "- Use bullets or numbered points\n"
+            "- Simple present tense\n"
+            "- Keep key facts\n\n"
+            f"Article: {input_text}\n\nSimple summary:"
             "Summary:"
         )
         MAX_ATTEMPTS = 3
