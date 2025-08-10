@@ -484,7 +484,7 @@ def payment_health():
 def payment_config():
     out = {"currency": "USD", "plans": {}}
     for key in ("Student", "Pro"):
-        pid = plans[key]["price_ids"].get("INR")
+        pid = plans[key]["price_ids"].get("USD")
         if not pid:
             out["plans"][key] = {"amount": None, "interval": "month", "price_id": None}
             continue
@@ -521,7 +521,7 @@ def create_subscription():
         if plan_key not in plans or plan_key == "free":
             return jsonify({"error": f"Invalid plan: {plan_input}"}), 400
 
-        price_id = plans[plan_key]["price_ids"].get("INR")
+        price_id = plans[plan_key]["price_ids"].get("USD")
         if not price_id:
             return jsonify({"error": f"Price ID (INR) not configured for plan {plan_key}"}), 500
 
