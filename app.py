@@ -734,17 +734,7 @@ import logging
 import traceback
 from flask import request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-
-# Enhanced imports for dyslexia support
-try:
-    import textstat
-    from rouge_score import rouge_scorer
-    TEXTSTAT_AVAILABLE = True
-    ROUGE_AVAILABLE = True
-except ImportError:
-    TEXTSTAT_AVAILABLE = False
-    ROUGE_AVAILABLE = False
-    logging.warning("textstat and/or rouge-score not available. Install with: pip install textstat rouge-score")
+import openai
 
 # Dyslexia-focused configuration
 class DyslexiaFriendlyConfig:
@@ -779,265 +769,6 @@ class DyslexiaFriendlyConfig:
     TRUNCATION_CHECK_PATTERN = r"[.!?]$"
     SUMMARY_MIN_WORDS = 40
 
-class DyslexiaFriendlyEvaluator:
-    """Evaluator with dyslexia support and engagement metrics"""
-    
-    def __init__(self):
-        try:
-            from rouge_score import rouge_scorer
-            self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-        except ImportError:
-            self.rouge_scorer = None
-        
-        # Coherence indicators
-        self.causal_words = {'because', 'since', 'so', 'therefore', 'thus', 'as a result'}
-        self.temporal_words = {'first', 'then', 'next', 'after', 'before', 'finally', 'now'}
-        self.contrast_words = {'but', 'however', 'although', 'despite', 'actually', 'in reality'}
-        self.question_words = {'who', 'what', 'where', 'when', 'why', 'how', '?'}
-        
-        self.narrative_connectors = self.causal_words | self.temporal_words | self.contrast_words
-    
-    def format_for_dyslexia(self, text: str) -> str:
-        """Apply dyslexia-friendly formatting"""
-        if not text:
-            return text
-            
-        # Ensure proper sentence endings
-        text = re.sub(r"\s+[^\s]*$", ".", text) if not re.search(DyslexiaFriendlyConfig.TRUNCATION_CHECK_PATTERN, text) else text
-        
-        # Split into sentences
-        sentences = self.split_sentences(text)
-        formatted = []
-        
-        for i, sentence in enumerate(sentences):
-            # Shorten long sentences
-            words = sentence.split()
-            if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
-                # Split at natural breaking point
-                for break_word in ['but', 'and', 'so', 'because']:
-                    if break_word in words[3:-3]:
-                        idx = words.index(break_word)
-                        sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
-                        break
-                else:
-                    # Force split at midpoint
-                    midpoint = len(words) // 2
-                    sentence = " ".join(words[:midpoint]) + ". " + " ".join(words[midpoint:])
-            
-            # Add to formatted output
-            formatted.append(sentence)
-            
-            # Add paragraph breaks
-            if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
-                formatted.append("\n\n")
-        
-        # Combine and add emojis
-        joined_text = " ".join(formatted)
-        return self.add_emojis(joined_text) if DyslexiaFriendlyConfig.USE_EMOJIS else joined_text
-
-    def add_emojis(self, text: str) -> str:
-        """Add relevant emojis to enhance engagement"""
-        emoji_map = {
-            r"\b(Trump|President)\b": "🇺🇸",
-            r"\b(plan|proposal)\b": "📋",
-            r"\b(crime|violence)\b": "🚨",
-            r"\b(data|numbers|statistics)\b": "📊",
-            r"\b(protest|oppose|against)\b": "✊",
-            r"\b(homeless|housing|shelter)\b": "🏠",
-            r"\b(press conference|announce)\b": "🎤",
-            r"\b(court|judge|legal)\b": "⚖️",
-            r"\b(question|why|how)\b": "❓",
-            r"\b(fact|truth|actually)\b": "✅",
-        }
-        
-        for pattern, emoji in emoji_map.items():
-            text = re.sub(pattern, f"\\g<0> {emoji}", text, flags=re.IGNORECASE)
-        return text
-
-    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
-        """Calculate narrative coherence metrics with engagement focus"""
-        # ... (same as before but add question detection) ...
-        if not text:
-            return {'coherence_score': 0.0, 'causal_connections': 0, 'temporal_markers': 0}
-        
-        text_lower = text.lower()
-        words = text_lower.split()
-        
-        # Count connectors
-        causal_count = sum(1 for word in self.causal_words if word in text_lower)
-        temporal_count = sum(1 for word in self.temporal_words if word in text_lower)
-        contrast_count = sum(1 for word in self.contrast_words if word in text_lower)
-        question_count = sum(1 for word in self.question_words if word in text_lower)
-        
-        # Calculate scores
-        connector_score = min(50, (causal_count * 10) + (temporal_count * 8) + (contrast_count * 6))
-        question_score = min(30, question_count * 15)
-        flow_score = self._calculate_sentence_flow(self.split_sentences(text))
-        
-        return {
-            'coherence_score': min(100, connector_score + question_score + (flow_score * 20)),
-            'causal_connections': causal_count,
-            'temporal_markers': temporal_count,
-            'contrast_markers': contrast_count,
-            'question_count': question_count,
-            'sentence_flow_score': flow_score
-        }
-
-    def calculate_engagement_score(self, text: str) -> float:
-        """Calculate how engaging the summary is"""
-        if not text:
-            return 0.0
-            
-        score = 0
-        text_lower = text.lower()
-        
-        # Questions boost engagement
-        if any(q in text_lower for q in self.question_words):
-            score += 30
-        
-        # Emoji impact
-        if re.search(r"[\U0001F000-\U0001FAFF]", text):
-            score += 25
-        
-        # Personal pronouns create connection
-        if re.search(r"\b(I|you|we|us|our)\b", text):
-            score += 15
-            
-        # Action verbs
-        action_verbs = re.findall(r"\b(is|are|was|were|has|have|do|does|did|will|can|should)\b", text_lower)
-        score += min(20, len(action_verbs) * 2)
-        
-        return min(100, score)
-
-    # ... (keep other methods like calculate_readability, split_sentences, etc from original) ...
-
-def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
-    """Create dyslexia-friendly prompts with engagement focus"""
-    base_instructions = [
-        # Attempt 0: Simple storytelling
-        (
-            "Create a FUN news summary like explaining to a friend:\n"
-            "- Use VERY short sentences (max 6 words)\n"
-            "- Add emojis after key words 🇺🇸📋🚨\n"
-            "- Start with the most exciting fact\n"
-            "- Ask 1 question to engage readers\n"
-            "- Use simple words (1-2 syllables)\n"
-            "- End with why it matters\n\n"
-            "Example:\n"
-            "Trump wants homeless OUT of D.C. 🚨\n"
-            "He claims crime will drop. 📉\n"
-            "BUT data shows crime FELL 35%! 📊\n"
-            "Why move people? 🤔\n"
-        ),
-        # Attempt 1: Problem/Solution format
-        (
-            "Write as: PROBLEM → SOLUTION → RESULT:\n"
-            "- PROBLEM: What's wrong? (1 short sentence)\n"
-            "- SOLUTION: What's being done? (with emojis)\n"
-            "- RESULT: What changed? (Ask a question at end!)\n"
-            "- Use arrows ➡️ between sections\n\n"
-            "Example:\n"
-            "PROBLEM: Crime in D.C.? 🚨\n"
-            "SOLUTION: Move homeless people out 📦➡️🚫\n"
-            "RESULT: But crime already FELL! ✅\n"
-            "Why do this now? ❓\n"
-        ),
-        # Attempt 2: Character-driven narrative
-        (
-            "Tell it like a story with characters:\n"
-            "- Trump: What HE wants (use 🎤 emoji)\n"
-            "- Opponents: What THEY say (use ✊ emoji)\n"
-            "- Reality: What DATA shows (use 📊 emoji)\n"
-            "- End with: What happens NEXT? (question)\n\n"
-            "Example:\n"
-            "Trump says: Move homeless NOW! 🎤\n"
-            "Protesters shout: This is wrong! ✊\n"
-            "Data shows: Crime DOWN 35% 📊\n"
-            "What will happen next? ❓\n"
-        ),
-        # Attempt 3: Contrast structure
-        (
-            "Write using CONTRAST pattern:\n"
-            "- Trump claims X... BUT reality shows Y\n"
-            "- Use 'ACTUALLY' for facts\n"
-            "- Include 1 QUESTION\n"
-            "- Add EMOJIS for key points\n"
-            "- MAX 8 words per line\n\n"
-            "Example:\n"
-            "Trump says crime is high. 🚨\n"
-            "BUT actually crime FELL 35%! ✅\n"
-            "He wants homeless moved out. 📦\n"
-            "Why? Data shows no need! 📊\n"
-        )
-    ]
-    
-    instruction = base_instructions[min(attempt, len(base_instructions) - 1)]
-    return f"{instruction}Article: {text[:1500]}\n\nFun summary:"
-
-# ... (previous imports and config classes) ...
-
-
-    def split_sentences(self, text: str):
-
-        """Split text into sentences for readability processing.
-
-
-
-        Uses simple punctuation-based splitting to avoid over-segmentation,
-
-        keeping things predictable for dyslexic readers.
-
-        """
-
-        import re
-
-        if not text:
-
-            return []
-
-        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-
-        return [s.strip() for s in sentences if s.strip()]
-
-
-
-
-
-    def calculate_readability(self, text: str) -> float:
-
-        """Compute Flesch Reading Ease. Returns 0.0 on failure."""
-
-        try:
-
-            import textstat
-
-            score = textstat.flesch_reading_ease(text or "")
-
-            # Guard against NaN or None
-
-            if score is None:
-
-                return 0.0
-
-            try:
-
-                # Some versions can return nan
-
-                from math import isnan
-
-                if isinstance(score, float) and isnan(score):
-
-                    return 0.0
-
-            except Exception:
-
-                pass
-
-            return round(float(score), 2)
-
-        except Exception:
-
-            return 0.0
 class NarrativeEvaluator:
     """Base evaluator with shared methods"""
     
@@ -1066,7 +797,6 @@ class NarrativeEvaluator:
     
     def calculate_readability(self, text: str) -> dict[str, float]:
         """Calculate readability metrics"""
-        # ... (implementation from original NarrativeEvaluator) ...
         if not text or not text.strip():
             return {
                 'flesch_reading_ease': 0.0,
@@ -1141,6 +871,215 @@ class NarrativeEvaluator:
             return score["rougeL"].fmeasure
         except:
             return 0.0
+
+class DyslexiaFriendlyEvaluator(NarrativeEvaluator):
+    """Evaluator with dyslexia support and engagement metrics"""
+    
+    def __init__(self):
+        super().__init__()  # Call parent initializer
+    
+    def format_for_dyslexia(self, text: str) -> str:
+        """Apply dyslexia-friendly formatting"""
+        if not text:
+            return text
+            
+        # Ensure proper sentence endings
+        text = re.sub(r"\s+[^\s]*$", ".", text) if not re.search(DyslexiaFriendlyConfig.TRUNCATION_CHECK_PATTERN, text) else text
+        
+        # Split into sentences
+        sentences = self.split_sentences(text)
+        formatted = []
+        
+        for i, sentence in enumerate(sentences):
+            # Shorten long sentences
+            words = sentence.split()
+            if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
+                # Split at natural breaking point
+                for break_word in ['but', 'and', 'so', 'because']:
+                    if break_word in words[3:-3]:
+                        idx = words.index(break_word)
+                        sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
+                        break
+                else:
+                    # Force split at midpoint
+                    midpoint = len(words) // 2
+                    sentence = " ".join(words[:midpoint]) + ". " + " ".join(words[midpoint:])
+            
+            # Add to formatted output
+            formatted.append(sentence)
+            
+            # Add paragraph breaks
+            if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
+                formatted.append("\n\n")
+        
+        # Combine and add emojis
+        joined_text = " ".join(formatted)
+        return self.add_emojis(joined_text) if DyslexiaFriendlyConfig.USE_EMOJIS else joined_text
+
+    def add_emojis(self, text: str) -> str:
+        """Add relevant emojis to enhance engagement"""
+        emoji_map = {
+            r"\b(Trump|President)\b": "🇺🇸",
+            r"\b(plan|proposal)\b": "📋",
+            r"\b(crime|violence)\b": "🚨",
+            r"\b(data|numbers|statistics)\b": "📊",
+            r"\b(protest|oppose|against)\b": "✊",
+            r"\b(homeless|housing|shelter)\b": "🏠",
+            r"\b(press conference|announce)\b": "🎤",
+            r"\b(court|judge|legal)\b": "⚖️",
+            r"\b(question|why|how)\b": "❓",
+            r"\b(fact|truth|actually)\b": "✅",
+        }
+        
+        for pattern, emoji in emoji_map.items():
+            text = re.sub(pattern, f"\\g<0> {emoji}", text, flags=re.IGNORECASE)
+        return text
+
+    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
+        """Calculate narrative coherence metrics with engagement focus"""
+        if not text:
+            return {
+                'coherence_score': 0.0,
+                'causal_connections': 0,
+                'temporal_markers': 0,
+                'contrast_markers': 0,
+                'question_count': 0,
+                'sentence_flow_score': 0.0
+            }
+        
+        text_lower = text.lower()
+        words = text_lower.split()
+        
+        # Count connectors
+        causal_count = sum(1 for word in self.causal_words if word in text_lower)
+        temporal_count = sum(1 for word in self.temporal_words if word in text_lower)
+        contrast_count = sum(1 for word in self.contrast_words if word in text_lower)
+        question_count = sum(1 for word in self.question_words if word in text_lower)
+        
+        # Calculate scores
+        connector_score = min(50, (causal_count * 10) + (temporal_count * 8) + (contrast_count * 6))
+        question_score = min(30, question_count * 15)
+        flow_score = self._calculate_sentence_flow(self.split_sentences(text))
+        
+        return {
+            'coherence_score': min(100, connector_score + question_score + (flow_score * 20)),
+            'causal_connections': causal_count,
+            'temporal_markers': temporal_count,
+            'contrast_markers': contrast_count,
+            'question_count': question_count,
+            'sentence_flow_score': flow_score
+        }
+    
+    def _calculate_sentence_flow(self, sentences: list[str]) -> float:
+        """Calculate how well sentences flow together"""
+        if len(sentences) < 2:
+            return 0.0
+        
+        flow_score = 0.0
+        for i in range(len(sentences) - 1):
+            current = sentences[i].lower().strip()
+            next_sent = sentences[i + 1].lower().strip()
+            
+            # Check for pronouns referring to previous sentence subjects
+            if any(word in next_sent.split()[:3] for word in ['he', 'she', 'it', 'they', 'this', 'that']):
+                flow_score += 0.5
+            
+            # Check for topic continuity (shared keywords)
+            current_words = set(current.split())
+            next_words = set(next_sent.split()[:5])  # First few words of next sentence
+            if current_words & next_words:
+                flow_score += 0.3
+        
+        return min(1.0, flow_score / (len(sentences) - 1))
+
+    def calculate_engagement_score(self, text: str) -> float:
+        """Calculate how engaging the summary is"""
+        if not text:
+            return 0.0
+            
+        score = 0
+        text_lower = text.lower()
+        
+        # Questions boost engagement
+        if any(q in text_lower for q in self.question_words):
+            score += 30
+        
+        # Emoji impact
+        if re.search(r"[\U0001F000-\U0001FAFF]", text):
+            score += 25
+        
+        # Personal pronouns create connection
+        if re.search(r"\b(I|you|we|us|our)\b", text):
+            score += 15
+            
+        # Action verbs
+        action_verbs = re.findall(r"\b(is|are|was|were|has|have|do|does|did|will|can|should)\b", text_lower)
+        score += min(20, len(action_verbs) * 2)
+        
+        return min(100, score)
+
+def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
+    """Create dyslexia-friendly prompts with engagement focus"""
+    base_instructions = [
+        # Attempt 0: Simple storytelling
+        (
+            "Create a FUN news summary like explaining to a friend:\n"
+            "- Use VERY short sentences (max 6 words)\n"
+            "- Add emojis after key words 🇺🇸📋🚨\n"
+            "- Start with the most exciting fact\n"
+            "- Ask 1 question to engage readers\n"
+            "- Use simple words (1-2 syllables)\n"
+            "- End with why it matters\n\n"
+            "Example:\n"
+            "Trump wants homeless OUT of D.C. 🚨\n"
+            "He claims crime will drop. 📉\n"
+            "BUT data shows crime FELL 35%! 📊\n"
+            "Why move people? 🤔\n"
+        ),
+        # Attempt 1: Problem/Solution format
+        (
+            "Write as: PROBLEM → SOLUTION → RESULT:\n"
+            "- PROBLEM: What's wrong? (1 short sentence)\n"
+            "- SOLUTION: What's being done? (with emojis)\n"
+            "- RESULT: What changed? (Ask a question at end!)\n"
+            "- Use arrows ➡️ between sections\n\n"
+            "Example:\n"
+            "PROBLEM: Crime in D.C.? 🚨\n"
+            "SOLUTION: Move homeless people out 📦➡️🚫\n"
+            "RESULT: But crime already FELL! ✅\n"
+            "Why do this now? ❓\n"
+        ),
+        # Attempt 2: Character-driven narrative
+        (
+            "Tell it like a story with characters:\n"
+            "- Trump: What HE wants (use 🎤 emoji)\n"
+            "- Opponents: What THEY say (use ✊ emoji)\n"
+            "- Reality: What DATA shows (use 📊 emoji)\n"
+            "- End with: What happens NEXT? (question)\n\n"
+            "Example:\n"
+            "Trump says: Move homeless NOW! 🎤\n"
+            "Protesters shout: This is wrong! ✊\n"
+            "Data shows: Crime DOWN 35% 📊\n"
+            "What will happen next? ❓\n"
+        ),
+        # Attempt 3: Contrast structure
+        (
+            "Write using CONTRAST pattern:\n"
+            "- Trump claims X... BUT reality shows Y\n"
+            "- Use 'ACTUALLY' for facts\n"
+            "- Include 1 QUESTION\n"
+            "- Add EMOJIS for key points\n"
+            "- MAX 8 words per line\n\n"
+            "Example:\n"
+            "Trump says crime is high. 🚨\n"
+            "BUT actually crime FELL 35%! ✅\n"
+            "He wants homeless moved out. 📦\n"
+            "Why? Data shows no need! 📊\n"
+        )
+    ]
+    
+    instruction = base_instructions[min(attempt, len(base_instructions) - 1)]
+    return f"{instruction}Article: {text[:1500]}\n\nFun summary:"
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
@@ -1319,7 +1258,7 @@ def summarize():
         logging.error(f"Summarization error: {str(e)}")
         logging.error(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
-# TTS endpoint
+    
 @app.post("/api/synthesize")
 @jwt_required()
 def synthesize():
