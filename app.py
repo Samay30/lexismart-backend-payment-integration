@@ -975,6 +975,69 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
     return f"{instruction}Article: {text[:1500]}\n\nFun summary:"
 
 # ... (previous imports and config classes) ...
+
+
+    def split_sentences(self, text: str):
+
+        """Split text into sentences for readability processing.
+
+
+
+        Uses simple punctuation-based splitting to avoid over-segmentation,
+
+        keeping things predictable for dyslexic readers.
+
+        """
+
+        import re
+
+        if not text:
+
+            return []
+
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+
+        return [s.strip() for s in sentences if s.strip()]
+
+
+
+
+
+    def calculate_readability(self, text: str) -> float:
+
+        """Compute Flesch Reading Ease. Returns 0.0 on failure."""
+
+        try:
+
+            import textstat
+
+            score = textstat.flesch_reading_ease(text or "")
+
+            # Guard against NaN or None
+
+            if score is None:
+
+                return 0.0
+
+            try:
+
+                # Some versions can return nan
+
+                from math import isnan
+
+                if isinstance(score, float) and isnan(score):
+
+                    return 0.0
+
+            except Exception:
+
+                pass
+
+            return round(float(score), 2)
+
+        except Exception:
+
+            return 0.0
 class NarrativeEvaluator:
     """Base evaluator with shared methods"""
     
