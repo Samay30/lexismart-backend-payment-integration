@@ -1029,9 +1029,9 @@ def create_narrative_prompt(text: str, attempt: int = 0) -> str:
     return f"{instruction}Article: {text[:1500]}\n\nConnected summary:"
 
 
-@app.route("/api/summarize-narrative", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
-def summarize_narrative():
+def summarize():
     """Enhanced summarization endpoint with narrative coherence"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
