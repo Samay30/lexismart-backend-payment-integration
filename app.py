@@ -232,7 +232,7 @@ openai.api_key = OPENAI_API_KEY
 # Plans
 plans = {
     "free": {
-        "requests": 5,
+        "requests": 25,
         "price_ids": {}
     },
     "Student": {
