@@ -461,8 +461,8 @@ def payment_health():
         "stripe_configured": bool(STRIPE_SECRET_KEY),
         "webhook_configured": bool(STRIPE_WEBHOOK_SECRET),
         "price_ids_configured": {
-            "student_inr": bool(plans["LexiSmart Students"]["price_ids"].get("INR")),
-            "pro_inr": bool(plans["LexiSmart Premium"]["price_ids"].get("INR")),
+            "student_inr": bool(plans["LexiSmart Students"]["price_ids"].get("USD")),
+            "pro_inr": bool(plans["LexiSmart Premium"]["price_ids"].get("USD")),
         },
         "frontend_url": FRONTEND_URL
     }
