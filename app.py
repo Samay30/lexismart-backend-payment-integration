@@ -923,6 +923,85 @@ class DyslexiaFriendlyEvaluator(NarrativeEvaluator):
         # Step 3: Structure with clear section breaks
         return "\n".join(formatted)
 
+    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
+        """Calculate narrative coherence metrics"""
+        if not text:
+            return {
+                'coherence_score': 0.0,
+                'causal_connections': 0,
+                'temporal_markers': 0,
+                'contrast_markers': 0,
+                'question_count': 0,
+                'sentence_flow_score': 0.0
+            }
+        
+        text_lower = text.lower()
+        words = text_lower.split()
+        
+        # Count connectors
+        causal_count = sum(1 for word in self.causal_words if word in text_lower)
+        temporal_count = sum(1 for word in self.temporal_words if word in text_lower)
+        contrast_count = sum(1 for word in self.contrast_words if word in text_lower)
+        question_count = sum(1 for word in self.question_words if word in text_lower)
+        
+        # Calculate scores
+        connector_score = min(50, (causal_count * 10) + (temporal_count * 8) + (contrast_count * 6))
+        question_score = min(30, question_count * 15)
+        flow_score = self._calculate_sentence_flow(self.split_sentences(text))
+        
+        return {
+            'coherence_score': min(100, connector_score + question_score + (flow_score * 20)),
+            'causal_connections': causal_count,
+            'temporal_markers': temporal_count,
+            'contrast_markers': contrast_count,
+            'question_count': question_count,
+            'sentence_flow_score': flow_score
+        }
+    
+    def _calculate_sentence_flow(self, sentences: list[str]) -> float:
+        """Calculate how well sentences flow together"""
+        if len(sentences) < 2:
+            return 0.0
+        
+        flow_score = 0.0
+        for i in range(len(sentences) - 1):
+            current = sentences[i].lower().strip()
+            next_sent = sentences[i + 1].lower().strip()
+            
+            # Check for pronouns referring to previous sentence subjects
+            if any(word in next_sent.split()[:3] for word in ['he', 'she', 'it', 'they', 'this', 'that']):
+                flow_score += 0.5
+            
+            # Check for topic continuity (shared keywords)
+            current_words = set(current.split())
+            next_words = set(next_sent.split()[:5])  # First few words of next sentence
+            if current_words & next_words:
+                flow_score += 0.3
+        
+        return min(1.0, flow_score / (len(sentences) - 1))
+
+    def calculate_engagement_score(self, text: str) -> float:
+        """Calculate how engaging the summary is"""
+        if not text:
+            return 0.0
+            
+        score = 0
+        text_lower = text.lower()
+        
+        # Questions boost engagement
+        if any(q in text_lower for q in self.question_words):
+            score += 30
+        
+        # Personal pronouns create connection
+        if re.search(r"\b(I|you|we|us|our)\b", text):
+            score += 15
+            
+        # Action verbs
+        action_verbs = re.findall(r"\b(is|are|was|were|has|have|do|does|did|will|can|should)\b", text_lower)
+        score += min(20, len(action_verbs) * 2)
+        
+        return min(100, score)
+
 def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
     """Create dyslexia-friendly prompts without emojis"""
     base_instructions = [
