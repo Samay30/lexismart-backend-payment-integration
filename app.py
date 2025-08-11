@@ -1007,45 +1007,33 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
     base_instructions = [
         # Attempt 0: Simple structured format
         (
-            "Create a concise news summary using this structure:\n"
-            "1. Main Event: What happened? (1 short sentence)\n"
-            "2. Key Quote: What was said? (1 short quote)\n"
-            "3. Opposition: Who disagrees? (1 short sentence)\n"
-            "4. Data Point: What do facts show? (1 short fact)\n"
-            "5. Next Steps: What might happen next? (1 question)\n\n"
-            "Rules:\n"
-            "- Max 8 words per line\n"
-            "- Simple words only\n"
-            "- No emojis\n"
-            "- Clear line breaks between sections\n\n"
+            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
+            "- Keep sentences 4–8 words\n"
+            "- Prefer one-syllable words\n"
+            "- Use bullets or numbered points\n"
+            "- Simple present tense\n"
+            "- Keep key facts\n\n"
+            
         ),
         # Attempt 1: Problem/Solution format
         (
-            "Write using this structure:\n"
-            "Problem: [What's the issue?]\n"
-            "Action: [What's being done?]\n"
-            "Reaction: [How do people respond?]\n"
-            "Data: [What do facts show?]\n"
-            "Question: [What might happen next?]\n\n"
-            "Rules:\n"
-            "- 6 words max per line\n"
-            "- Short sentences only\n"
-            "- No emojis\n"
-            "- Empty line between sections\n\n"
+            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
+            "- Keep sentences 4–8 words\n"
+            "- Prefer one-syllable words\n"
+            "- Use bullets or numbered points\n"
+            "- Simple present tense\n"
+            "- Keep key facts\n\n"
+            
         ),
         # Attempt 2: Timeline format
         (
-            "Tell as a simple timeline:\n"
-            "First: [Starting event]\n"
-            "Then: [What happened next?]\n"
-            "But: [Contrasting information]\n"
-            "Now: [Current situation]\n"
-            "Next: [What might happen?]\n\n"
-            "Rules:\n"
-            "- 7 words max per line\n"
-            "- One event per line\n"
-            "- No emojis\n"
-            "- Skip unnecessary details\n\n"
+           "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
+            "- Keep sentences 4–8 words\n"
+            "- Prefer one-syllable words\n"
+            "- Use bullets or numbered points\n"
+            "- Simple present tense\n"
+            "- Keep key facts\n\n"
+           
         )
     ]
     
