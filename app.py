@@ -1235,54 +1235,113 @@ def synthesize():
         if not ELEVENLABS_API_KEY:
             return jsonify({"error": "Voice service not configured"}), 500
 
-        VOICES = {"encouraging_female": "ZT9u07TYPVl83ejeLakq"}
-        DEFAULT_VOICE = "encouraging_female"
+        VOICES = {
+            "clear_narrator": "21m00Tcm4TlvDq8ikWAM",  # Rachel - clear, neutral delivery
+            "calm_male": "AZnzlk1XvdvUeBnXmlld",     # Dominic - calm, authoritative
+            "warm_female": "EXAVITQu4vr4xnSDxMaL"    # Sarah - warm, engaging
+        }
+        DEFAULT_VOICE = "clear_narrator"
         MAX_TEXT_LENGTH = 1000
 
         if len(text) > MAX_TEXT_LENGTH:
             text = text[:MAX_TEXT_LENGTH]
 
+        # Preprocess text for better TTS delivery
+        def optimize_for_tts(content):
+            # Add strategic pauses for natural rhythm
+            content = re.sub(r'([.!?])', r'\1 ', content)  # Space after punctuation
+            content = re.sub(r'\s+', ' ', content)  # Normalize whitespace
+            
+            # Add pauses between sections
+            content = re.sub(r'\n\n+', '<break time="800ms"/>', content)
+            content = re.sub(r'\n', '<break time="500ms"/>', content)
+            
+            # Add pauses for commas
+            content = re.sub(r',', ',<break time="200ms"/>', content)
+            
+            # Emphasize key phrases
+            key_phrases = re.findall(r'\b(important|warning|note:|however|but|critical)\b', content, re.IGNORECASE)
+            for phrase in set(key_phrases):
+                content = content.replace(phrase, f'<emphasis level="strong">{phrase}</emphasis>')
+            
+            # Slow down numbers and complex terms
+            content = re.sub(r'(\d+[.,]\d+)', r'<prosody rate="slow">\1</prosody>', content)
+            
+            return f'<speak>{content}</speak>'
+
         try:
+            # Preprocess text for better delivery
+            optimized_text = optimize_for_tts(text)
+            
             # Try new SDK pattern first
             client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-            stream = client.text_to_speech.convert(
-                text=text,
-                voice_id=VOICES[DEFAULT_VOICE],
-                model_id="eleven_turbo_v2_5",
-                output_format="mp3_44100_128",
-                voice_settings=VoiceSettings(
-                    stability=0.75, 
-                    similarity_boost=0.75, 
-                    style=0.0, 
-                    use_speaker_boost=True
-                )
+            
+            # Voice settings tuned for clear, natural delivery
+            voice_settings = VoiceSettings(
+                stability=0.35,        # Lower = more expressive (range: 0-1)
+                similarity_boost=0.85,  # Higher = more consistent voice (range: 0-1)
+                style=0.4,              # Moderate expressiveness (range: 0-1)
+                use_speaker_boost=True
             )
+            
+            stream = client.text_to_speech.convert(
+                text=optimized_text,
+                voice_id=VOICES[DEFAULT_VOICE],
+                model_id="eleven_english_sts_v2",  # More natural model
+                output_format="mp3_44100_128",
+                voice_settings=voice_settings
+            )
+            
             audio_bytes = b"".join(stream)
             
-            log_usage(int(user_id), "tts", {"text_length": len(text)})
-            return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
+            log_usage(int(user_id), "tts", {
+                "text_length": len(text),
+                "voice": DEFAULT_VOICE,
+                "optimized": True
+            })
             
-        except Exception:
-            # Legacy fallback
+            return send_file(
+                io.BytesIO(audio_bytes),
+                mimetype="audio/mpeg",
+                as_attachment=False,
+                download_name="lexismart_audio.mp3"
+            )
+            
+        except Exception as e:
+            logger.error(f"TTS primary error: {e}")
+            # Fallback to simpler generation without SSML
             try:
-                elevenlabs.set_api_key(ELEVENLABS_API_KEY)
-                audio_bytes = elevenlabs.generate(
-                    text=text,
-                    voice=VOICES[DEFAULT_VOICE],
-                    model="eleven_turbo_v2_5"
+                client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+                stream = client.text_to_speech.convert(
+                    text=text,  # Use original text without SSML
+                    voice_id=VOICES[DEFAULT_VOICE],
+                    model_id="eleven_monolingual_v1",
+                    output_format="mp3_44100_128",
+                    voice_settings=VoiceSettings(
+                        stability=0.5,
+                        similarity_boost=0.75,
+                        style=0.3,
+                        use_speaker_boost=True
+                    )
+                )
+                audio_bytes = b"".join(stream)
+                
+                log_usage(int(user_id), "tts_fallback", {"text_length": len(text)})
+                return send_file(
+                    io.BytesIO(audio_bytes),
+                    mimetype="audio/mpeg",
+                    as_attachment=False,
+                    download_name="lexismart_audio.mp3"
                 )
                 
-                log_usage(int(user_id), "tts", {"text_length": len(text)})
-                return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
-                
-            except Exception as e:
-                logger.error(f"TTS fallback error: {e}")
+            except Exception as fallback_e:
+                logger.error(f"TTS fallback error: {fallback_e}")
                 return jsonify({"error": "Voice generation failed"}), 500
 
     except Exception as e:
-        logger.error(f"TTS error: {e}")
+        logger.error(f"TTS system error: {e}")
         return jsonify({"error": "Voice generation failed"}), 500
-
+    
 # Mind Map Storage
 @app.post("/api/save-mindmap")
 @jwt_required()
