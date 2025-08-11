@@ -782,26 +782,25 @@ def format_for_dyslexia(text: str) -> str:
     return "\n".join(formatted)
 
 def create_summary_prompt(text: str) -> str:
-    """Create optimized prompt for cohesive summaries"""
+   
     return f"""
     Create a concise, easy-to-read summary for dyslexic readers. Follow these rules:
     
     1. Use VERY short sentences (4-8 words)
     2. Use simple words (1-2 syllables)
-    3. Maintain narrative flow between sentences
-    4. Keep the main idea clear
-    5. End with a key takeaway
-    6. Use proper names consistently
-    7. Keep it fun and engaging
+    3. Keep the main idea clear
+    4. End with a key takeaway
+    5. Keep it fun and engaging
+    6. Make sure the sentences don't look scattered but connected to each other
     
     Structure:
     - Start with what happened
     - Explain why it matters
     - End with what might happen next
     
-    Article: {text[:2000]}
+    This is the Article: {text}
     
-    Clear summary:
+    Now return a clear summary based on the requirements mentioned above:
     """
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
@@ -881,21 +880,48 @@ def summarize():
 def synthesize():
     try:
         user_id = get_jwt_identity()
-        data = request.get_json() or {}
-        text = (data.get("text") or "").strip()
-        
+        body = request.get_json() or {}
+        text = (body.get("text") or "").strip()
+
         if not text:
             return jsonify({"error": "No text provided"}), 400
-
         if not ELEVENLABS_API_KEY:
             return jsonify({"error": "Voice service not configured"}), 500
 
-        VOICE_ID = "ZT9u07TYPVl83ejeLakq"  # Rachel - clear, neutral delivery
+        VOICE_ID = "ZT9u07TYPVl83ejeLakq"  # Rachel
         MAX_TEXT_LENGTH = 1000
-        ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
-        if len(text) > MAX_TEXT_LENGTH:
-            text = text[:MAX_TEXT_LENGTH]
+        # Dyslexia-friendly controls
+        DEFAULT_SPEED = 0.85  # slower than normal (range 0.7–1.2)
+        requested_speed = body.get("speed")
+        try:
+            speed = float(requested_speed) if requested_speed is not None else DEFAULT_SPEED
+        except (TypeError, ValueError):
+            speed = DEFAULT_SPEED
+        # clamp to supported range
+        speed = max(0.7, min(1.2, speed))
+
+        add_pauses = bool(body.get("add_pauses", False))
+        pause_seconds = float(body.get("pause_seconds", 0.6))  # between 0.3–1.5 usually sounds natural
+
+        # If using SSML pauses, switch to an SSML-capable model
+        # (Flash v2.5 / Turbo v2.5 / English v1; see docs)
+        # Otherwise keep your current model.
+        if add_pauses:
+            model_id = "eleven_turbo_v2_5"
+            # Insert short SSML pauses between sentences.
+            # Keep it conservative to avoid artifacts.
+            import re as _re
+            sent_split = _re.sub(r'([.!?])(\s+)', r'\1 <break time="{:.1f}s" /> '.format(pause_seconds), text)
+            text_payload = f"<speak>{sent_split}</speak>"
+        else:
+            model_id = "eleven_monolingual_v1"  # your original
+            text_payload = text
+
+        if len(text_payload) > MAX_TEXT_LENGTH:
+            text_payload = text_payload[:MAX_TEXT_LENGTH]
+
+        ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
         headers = {
             "Accept": "audio/mpeg",
@@ -903,30 +929,37 @@ def synthesize():
             "xi-api-key": ELEVENLABS_API_KEY
         }
 
-        data = {
-            "text": text,
-            "model_id": "eleven_monolingual_v1",  # More reliable model
+        payload = {
+            "text": text_payload,
+            "model_id": model_id,
             "voice_settings": {
                 "stability": 0.5,
-                "similarity_boost": 0.75
+                "similarity_boost": 0.75,
+                "speed": speed  # <-- key change for slower TTS
             }
         }
 
+        # Enable SSML parsing when we included SSML tags
+        if add_pauses:
+            payload["enable_ssml_parsing"] = True
+
         try:
-            response = requests.post(ELEVENLABS_URL, json=data, headers=headers, timeout=10)
+            response = requests.post(ELEVENLABS_URL, json=payload, headers=headers, timeout=15)
             response.raise_for_status()
-            
             audio_bytes = response.content
-            
-            log_usage(int(user_id), "tts", {"text_length": len(text)})
-            
+
+            log_usage(int(user_id), "tts", {
+                "text_length": len(text),
+                "speed": speed,
+                "add_pauses": add_pauses
+            })
+
             return send_file(
                 io.BytesIO(audio_bytes),
                 mimetype="audio/mpeg",
                 as_attachment=False,
                 download_name="lexismart_audio.mp3"
             )
-            
         except Exception as e:
             logger.error(f"TTS API error: {e}")
             return jsonify({"error": "Voice generation failed. Please try again."}), 500
@@ -934,7 +967,7 @@ def synthesize():
     except Exception as e:
         logger.error(f"TTS system error: {e}")
         return jsonify({"error": "Voice service unavailable"}), 500
-    
+
 # Mind Map Storage
 @app.post("/api/save-mindmap")
 @jwt_required()
