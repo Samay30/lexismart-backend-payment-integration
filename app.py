@@ -792,6 +792,7 @@ def create_summary_prompt(text: str) -> str:
     4. Keep the main idea clear
     5. End with a key takeaway
     6. Use proper names consistently
+    7. Keep it fun and engaging
     
     Structure:
     - Start with what happened
@@ -889,7 +890,7 @@ def synthesize():
         if not ELEVENLABS_API_KEY:
             return jsonify({"error": "Voice service not configured"}), 500
 
-        VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel - clear, neutral delivery
+        VOICE_ID = "ZT9u07TYPVl83ejeLakq"  # Rachel - clear, neutral delivery
         MAX_TEXT_LENGTH = 1000
         ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
