@@ -873,213 +873,105 @@ class NarrativeEvaluator:
             return 0.0
 
 class DyslexiaFriendlyEvaluator(NarrativeEvaluator):
-    """Evaluator with dyslexia support and engagement metrics"""
+    """Evaluator with enhanced dyslexia support"""
     
     def __init__(self):
-        super().__init__()  # Call parent initializer
+        super().__init__()
+        # Reduced cognitive load features
+        self.sentence_break_words = ['but', 'and', 'so', 'because', 'however', 'therefore']
     
     def format_for_dyslexia(self, text: str) -> str:
-        """Apply dyslexia-friendly formatting"""
+        """Apply enhanced dyslexia-friendly formatting"""
         if not text:
             return text
             
-        # Ensure proper sentence endings
-        text = re.sub(r"\s+[^\s]*$", ".", text) if not re.search(DyslexiaFriendlyConfig.TRUNCATION_CHECK_PATTERN, text) else text
+        # Step 1: Clean up formatting issues
+        text = re.sub(r'\*\*|\*', '', text)  # Remove bold formatting
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        text = re.sub(r'\s([.,!?])', r'\1', text)  # Fix punctuation spacing
+        text = re.sub(r'\.{2,}', '.', text)  # Remove excessive periods
         
-        # Split into sentences
+        # Step 2: Split into sentences
         sentences = self.split_sentences(text)
         formatted = []
         
         for i, sentence in enumerate(sentences):
-            # Shorten long sentences
+            # Clean sentence
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            # Break long sentences at natural points
             words = sentence.split()
             if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
-                # Split at natural breaking point
-                for break_word in ['but', 'and', 'so', 'because']:
+                for break_word in self.sentence_break_words:
                     if break_word in words[3:-3]:
                         idx = words.index(break_word)
                         sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
                         break
-                else:
-                    # Force split at midpoint
-                    midpoint = len(words) // 2
-                    sentence = " ".join(words[:midpoint]) + ". " + " ".join(words[midpoint:])
             
-            # Add to formatted output
+            # Capitalize first word only
+            if sentence:
+                sentence = sentence[0].upper() + sentence[1:]
+                
             formatted.append(sentence)
             
             # Add paragraph breaks
             if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
-                formatted.append("\n\n")
+                formatted.append("")  # Empty line for paragraph break
         
-        # Combine and add emojis
-        joined_text = " ".join(formatted)
-        return self.add_emojis(joined_text) if DyslexiaFriendlyConfig.USE_EMOJIS else joined_text
-
-    def add_emojis(self, text: str) -> str:
-        """Add relevant emojis to enhance engagement"""
-        emoji_map = {
-            r"\b(Trump|President)\b": "🇺🇸",
-            r"\b(plan|proposal)\b": "📋",
-            r"\b(crime|violence)\b": "🚨",
-            r"\b(data|numbers|statistics)\b": "📊",
-            r"\b(protest|oppose|against)\b": "✊",
-            r"\b(homeless|housing|shelter)\b": "🏠",
-            r"\b(press conference|announce)\b": "🎤",
-            r"\b(court|judge|legal)\b": "⚖️",
-            r"\b(question|why|how)\b": "❓",
-            r"\b(fact|truth|actually)\b": "✅",
-        }
-        
-        for pattern, emoji in emoji_map.items():
-            text = re.sub(pattern, f"\\g<0> {emoji}", text, flags=re.IGNORECASE)
-        return text
-
-    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
-        """Calculate narrative coherence metrics with engagement focus"""
-        if not text:
-            return {
-                'coherence_score': 0.0,
-                'causal_connections': 0,
-                'temporal_markers': 0,
-                'contrast_markers': 0,
-                'question_count': 0,
-                'sentence_flow_score': 0.0
-            }
-        
-        text_lower = text.lower()
-        words = text_lower.split()
-        
-        # Count connectors
-        causal_count = sum(1 for word in self.causal_words if word in text_lower)
-        temporal_count = sum(1 for word in self.temporal_words if word in text_lower)
-        contrast_count = sum(1 for word in self.contrast_words if word in text_lower)
-        question_count = sum(1 for word in self.question_words if word in text_lower)
-        
-        # Calculate scores
-        connector_score = min(50, (causal_count * 10) + (temporal_count * 8) + (contrast_count * 6))
-        question_score = min(30, question_count * 15)
-        flow_score = self._calculate_sentence_flow(self.split_sentences(text))
-        
-        return {
-            'coherence_score': min(100, connector_score + question_score + (flow_score * 20)),
-            'causal_connections': causal_count,
-            'temporal_markers': temporal_count,
-            'contrast_markers': contrast_count,
-            'question_count': question_count,
-            'sentence_flow_score': flow_score
-        }
-    
-    def _calculate_sentence_flow(self, sentences: list[str]) -> float:
-        """Calculate how well sentences flow together"""
-        if len(sentences) < 2:
-            return 0.0
-        
-        flow_score = 0.0
-        for i in range(len(sentences) - 1):
-            current = sentences[i].lower().strip()
-            next_sent = sentences[i + 1].lower().strip()
-            
-            # Check for pronouns referring to previous sentence subjects
-            if any(word in next_sent.split()[:3] for word in ['he', 'she', 'it', 'they', 'this', 'that']):
-                flow_score += 0.5
-            
-            # Check for topic continuity (shared keywords)
-            current_words = set(current.split())
-            next_words = set(next_sent.split()[:5])  # First few words of next sentence
-            if current_words & next_words:
-                flow_score += 0.3
-        
-        return min(1.0, flow_score / (len(sentences) - 1))
-
-    def calculate_engagement_score(self, text: str) -> float:
-        """Calculate how engaging the summary is"""
-        if not text:
-            return 0.0
-            
-        score = 0
-        text_lower = text.lower()
-        
-        # Questions boost engagement
-        if any(q in text_lower for q in self.question_words):
-            score += 30
-        
-        # Emoji impact
-        if re.search(r"[\U0001F000-\U0001FAFF]", text):
-            score += 25
-        
-        # Personal pronouns create connection
-        if re.search(r"\b(I|you|we|us|our)\b", text):
-            score += 15
-            
-        # Action verbs
-        action_verbs = re.findall(r"\b(is|are|was|were|has|have|do|does|did|will|can|should)\b", text_lower)
-        score += min(20, len(action_verbs) * 2)
-        
-        return min(100, score)
+        # Step 3: Structure with clear section breaks
+        return "\n".join(formatted)
 
 def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
-    """Create dyslexia-friendly prompts with engagement focus"""
+    """Create dyslexia-friendly prompts without emojis"""
     base_instructions = [
-        # Attempt 0: Simple storytelling
+        # Attempt 0: Simple structured format
         (
-            "Create a FUN news summary like explaining to a friend:\n"
-            "- Use VERY short sentences (max 6 words)\n"
-            "- Add emojis after key words 🇺🇸📋🚨\n"
-            "- Start with the most exciting fact\n"
-            "- Ask 1 question to engage readers\n"
-            "- Use simple words (1-2 syllables)\n"
-            "- End with why it matters\n\n"
-            "Example:\n"
-            "Trump wants homeless OUT of D.C. 🚨\n"
-            "He claims crime will drop. 📉\n"
-            "BUT data shows crime FELL 35%! 📊\n"
-            "Why move people? 🤔\n"
+            "Create a concise news summary using this structure:\n"
+            "1. Main Event: What happened? (1 short sentence)\n"
+            "2. Key Quote: What was said? (1 short quote)\n"
+            "3. Opposition: Who disagrees? (1 short sentence)\n"
+            "4. Data Point: What do facts show? (1 short fact)\n"
+            "5. Next Steps: What might happen next? (1 question)\n\n"
+            "Rules:\n"
+            "- Max 8 words per line\n"
+            "- Simple words only\n"
+            "- No emojis\n"
+            "- Clear line breaks between sections\n\n"
         ),
         # Attempt 1: Problem/Solution format
         (
-            "Write as: PROBLEM → SOLUTION → RESULT:\n"
-            "- PROBLEM: What's wrong? (1 short sentence)\n"
-            "- SOLUTION: What's being done? (with emojis)\n"
-            "- RESULT: What changed? (Ask a question at end!)\n"
-            "- Use arrows ➡️ between sections\n\n"
-            "Example:\n"
-            "PROBLEM: Crime in D.C.? 🚨\n"
-            "SOLUTION: Move homeless people out 📦➡️🚫\n"
-            "RESULT: But crime already FELL! ✅\n"
-            "Why do this now? ❓\n"
+            "Write using this structure:\n"
+            "Problem: [What's the issue?]\n"
+            "Action: [What's being done?]\n"
+            "Reaction: [How do people respond?]\n"
+            "Data: [What do facts show?]\n"
+            "Question: [What might happen next?]\n\n"
+            "Rules:\n"
+            "- 6 words max per line\n"
+            "- Short sentences only\n"
+            "- No emojis\n"
+            "- Empty line between sections\n\n"
         ),
-        # Attempt 2: Character-driven narrative
+        # Attempt 2: Timeline format
         (
-            "Tell it like a story with characters:\n"
-            "- Trump: What HE wants (use 🎤 emoji)\n"
-            "- Opponents: What THEY say (use ✊ emoji)\n"
-            "- Reality: What DATA shows (use 📊 emoji)\n"
-            "- End with: What happens NEXT? (question)\n\n"
-            "Example:\n"
-            "Trump says: Move homeless NOW! 🎤\n"
-            "Protesters shout: This is wrong! ✊\n"
-            "Data shows: Crime DOWN 35% 📊\n"
-            "What will happen next? ❓\n"
-        ),
-        # Attempt 3: Contrast structure
-        (
-            "Write using CONTRAST pattern:\n"
-            "- Trump claims X... BUT reality shows Y\n"
-            "- Use 'ACTUALLY' for facts\n"
-            "- Include 1 QUESTION\n"
-            "- Add EMOJIS for key points\n"
-            "- MAX 8 words per line\n\n"
-            "Example:\n"
-            "Trump says crime is high. 🚨\n"
-            "BUT actually crime FELL 35%! ✅\n"
-            "He wants homeless moved out. 📦\n"
-            "Why? Data shows no need! 📊\n"
+            "Tell as a simple timeline:\n"
+            "First: [Starting event]\n"
+            "Then: [What happened next?]\n"
+            "But: [Contrasting information]\n"
+            "Now: [Current situation]\n"
+            "Next: [What might happen?]\n\n"
+            "Rules:\n"
+            "- 7 words max per line\n"
+            "- One event per line\n"
+            "- No emojis\n"
+            "- Skip unnecessary details\n\n"
         )
     ]
     
     instruction = base_instructions[min(attempt, len(base_instructions) - 1)]
-    return f"{instruction}Article: {text[:1500]}\n\nFun summary:"
+    return f"{instruction}Article: {text[:1500]}\n\nStructured summary:"
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
