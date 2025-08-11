@@ -1,6 +1,8 @@
 import os
 import io
+import math
 import re
+import textstat
 import json
 import time
 import hashlib
@@ -8,6 +10,7 @@ import logging
 import tempfile
 import traceback
 from datetime import datetime, timedelta
+from typing import Optional
 
 import psycopg2
 import psycopg2.extras
@@ -731,100 +734,116 @@ def downgrade_to_free(customer_id: str):
 import re
 import logging
 import traceback
-from flask import request, jsonify, send_file
-import openai
-import requests
+
 import io
 
-# Configuration for dyslexia-friendly formatting
+# ---------------- Configuration ----------------
 class DyslexiaFriendlyConfig:
-    MAX_SENTENCE_LENGTH = 8
-    MAX_PARAGRAPH_LENGTH = 3
+    # Only used for model response budget, not for line breaking (we removed the formatter)
     SUMMARY_MAX_TOKENS = 300
 
-def format_for_dyslexia(text: str) -> str:
-    """Apply clean, dyslexia-friendly formatting"""
-    if not text:
-        return text
-        
-    # Clean up text
-    text = re.sub(r'\*\*|\*', '', text)  # Remove bold formatting
-    text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
-    text = re.sub(r'\s([.,!?])', r'\1', text)  # Fix punctuation spacing
-    
-    # Split into sentences
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    formatted = []
-    
-    for i, sentence in enumerate(sentences):
-        # Clean and capitalize
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        sentence = sentence[0].upper() + sentence[1:]
-            
-        # Break long sentences
-        words = sentence.split()
-        if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
-            # Split at natural breaking point
-            for break_word in ['but', 'and', 'so', 'because']:
-                if break_word in words[3:-3]:
-                    idx = words.index(break_word)
-                    sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
-                    break
-        
-        formatted.append(sentence)
-        
-        # Add paragraph breaks
-        if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
-            formatted.append("")  # Empty line
-    
-    return "\n".join(formatted)
+# ---------------- Metric helpers ----------------
+_ST_MODEL = None  # cached SentenceTransformer model
 
-def create_summary_prompt(text: str) -> str:
-   
+def flesch_reading_ease(text: str) -> float:
+    """Return Flesch Reading Ease in [0, 100]."""
+    try:
+        fre = float(textstat.flesch_reading_ease(text))
+        return max(0.0, min(100.0, fre))
+    except Exception:
+        return 0.0
+
+def try_bertscore(candidate: str, source: str) -> Optional[float]:
+    """Try BERTScore F1 (0..1). Return None if unavailable or errors."""
+    try:
+        from bert_score import score as bert_score
+        P, R, F1 = bert_score([candidate], [source], lang="en", rescale_with_baseline=True)
+        return float(F1[0].item())
+    except Exception:
+        return None
+
+def fallback_semantic_sim(candidate: str, source: str) -> float:
+    """Fallback to Sentence-Transformers cosine similarity (0..1)."""
+    global _ST_MODEL
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        if _ST_MODEL is None:
+            _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        emb = _ST_MODEL.encode([candidate, source], convert_to_tensor=True, normalize_embeddings=True)
+        sim = util.cos_sim(emb[0], emb[1]).item()
+        # emb are normalized; sim should already be in [0,1], but clamp anyway
+        return max(0.0, min(1.0, float(sim)))
+    except Exception:
+        # Last resort: neutral-ish score to avoid total failure
+        return 0.5
+
+def semantic_score(candidate: str, source: str) -> float:
+    """Preferred: BERTScore F1; fallback to ST cosine similarity. Returns 0..1."""
+    bs = try_bertscore(candidate, source)
+    return bs if bs is not None else fallback_semantic_sim(candidate, source)
+
+def balance_score(fre: float, bert: float) -> float:
+    """Combine metrics as 0.5*FRE + 0.5*(BERT*100)."""
+    return 0.5 * fre + 0.5 * (bert * 100.0)
+
+# ---------------- Prompt builder ----------------
+def create_summary_prompt(text: str, target_fre: int, target_bert: float) -> str:
     return f"""
-    Create a concise, easy-to-read summary for dyslexic readers. Follow these rules:
-    
-    1. Use VERY short sentences (4-8 words)
-    2. Use simple words (1-2 syllables)
-    3. Keep the main idea clear
-    4. End with a key takeaway
-    5. Keep it fun and engaging
-    6. Make sure the sentences don't look scattered but connected to each other
-    
-    Structure:
-    - Start with what happened
-    - Explain why it matters
-    - End with what might happen next
-    
-    This is the Article: {text}
-    
-    Now return a clear summary based on the requirements mentioned above:
-    """
+You are a skilled editor for dyslexic readers.
+
+Write a concise, engaging summary with:
+- Short, natural sentences (~6–12 words)
+- Simple words (mostly 1–2 syllables)
+- Clear flow with light connectors (so, but, then, because)
+- No headings or bullet points
+- 90–140 words total
+
+Quality targets you should aim for:
+- Flesch Reading Ease ≥ {target_fre}
+- High meaning preservation (BERT-like similarity ≥ {target_bert})
+
+Structure:
+1) What happened
+2) Why it matters
+3) What might happen next
+4) End with one plain-english key takeaway.
+
+Important:
+- Keep it cohesive, not choppy.
+- Avoid repetitive sentence starters.
+- Output ONLY the summary text.
+
+Article:
+{text}
+"""
+
+# ---------------- Route ----------------
+# Note: ensure `app` is already created in your actual project.
+
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
 def summarize():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    
+
     try:
-        # Get input text
+        # -------- Input text --------
         if request.method == "GET":
             input_text = (request.args.get("text") or "").strip()
+            post_json = {}
         else:
-            data = request.get_json() or {}
-            input_text = (data.get("text") or "").strip()
-        
+            post_json = request.get_json() or {}
+            input_text = (post_json.get("text") or "").strip()
+
         if not input_text:
             return jsonify({"error": "No text provided"}), 400
-        
-        # Truncate very long text
-        if len(input_text) > 10000:
-            input_text = input_text[:10000] + " [TEXT TRUNCATED]"
-        
-        # User authentication and limits
+
+        # Bound extremely long input (cost control)
+        if len(input_text) > 20000:
+            input_text = input_text[:20000] + " [TEXT TRUNCATED]"
+
+        # -------- Auth & limits --------
         user_id = get_jwt_identity()
         user = None
         if user_id:
@@ -836,45 +855,93 @@ def summarize():
                     "error": "Request limit reached. Upgrade your plan for more requests.",
                     "upgrade_url": f"{FRONTEND_URL}/upgrade"
                 }), 402
-        
-        # Generate summary
-        prompt = create_summary_prompt(input_text)
-        
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=DyslexiaFriendlyConfig.SUMMARY_MAX_TOKENS
-        )
-        
-        raw_summary = (resp.choices[0].message.content or "").strip()
-        formatted_summary = format_for_dyslexia(raw_summary)
-        
-        # Ensure proper ending
-        if not re.search(r'[.!?]$', formatted_summary):
-            formatted_summary = re.sub(r'\W*$', '.', formatted_summary)
-        
-        # Update user request count
+
+        # -------- Targets / knobs (optional overrides via POST) --------
+        target_fre = int(post_json.get("target_fre", 85))
+        target_bert = float(post_json.get("target_bert", 0.85))
+        max_attempts = int(post_json.get("max_attempts", 4))
+
+        # -------- Build initial prompt --------
+        system_msg = {"role": "system", "content": "You are a careful editor optimizing readability and meaning."}
+        base_user_prompt = create_summary_prompt(input_text, target_fre, target_bert)
+        messages = [system_msg, {"role": "user", "content": base_user_prompt}]
+
+        best = {"text": None, "fre": -1.0, "bert": -1.0, "balance": -math.inf}
+        attempts_used = 0
+
+        for attempt in range(1, max_attempts + 1):
+            attempts_used = attempt
+            # --- Generate candidate ---
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.4,  # steadier phrasing; raise to 0.5–0.6 if too rigid
+                max_tokens=DyslexiaFriendlyConfig.SUMMARY_MAX_TOKENS
+            )
+            candidate = (resp.choices[0].message.content or "").strip()
+
+            # --- Score candidate ---
+            fre = flesch_reading_ease(candidate)
+            bert = semantic_score(candidate, input_text)
+            bal = balance_score(fre, bert)
+
+            # Track best
+            if bal > best["balance"]:
+                best.update({"text": candidate, "fre": fre, "bert": bert, "balance": bal})
+
+            # Early stop if both targets met
+            if fre >= target_fre and bert >= target_bert:
+                break
+
+            # --- Feedback loop ---
+            tweaks = []
+            if fre < target_fre:
+                tweaks.append(f"raise FRE to ≥ {target_fre} by using simpler words and slightly shorter sentences")
+            if bert < target_bert:
+                tweaks.append(f"increase meaning preservation to ≥ {target_bert} by keeping all key facts and names")
+            tweak_text = "; ".join(tweaks) if tweaks else "refine flow to improve both readability and meaning"
+
+            feedback = (
+                f"Scores now: FRE={fre:.1f}, SIM={bert:.3f}, BAL={bal:.1f}. "
+                f"Revise to {tweak_text}. Keep 90–140 words, cohesive tone, no bullets, no headings."
+            )
+
+            # Continue conversation with explicit feedback
+            messages.append({"role": "assistant", "content": candidate})
+            messages.append({"role": "user", "content": feedback})
+
+        final_text = best["text"] or "Summary unavailable."
+
+        # -------- Usage logging --------
         if user_id:
             increment_user_requests(int(user_id))
-            log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
-        
-        # Calculate remaining requests
-        remaining = None
-        if user_id and user:
-            remaining = max(0, user["request_limit"] - user["requests_used"] - 1)
-        
+            log_usage(int(user_id), "summarize", {
+                "text_length": len(input_text),
+                "attempts": attempts_used,
+                "fre": best["fre"],
+                "bert": best["bert"],
+                "balance": best["balance"],
+                "targets": {"fre": target_fre, "bert": target_bert},
+            })
+
+        # -------- Response --------
         return jsonify({
-            "summary_text": formatted_summary,
-            "requests_remaining": remaining,
-            "dyslexia_friendly": True
+            "summary_text": final_text,
+            "scores": {
+                "flesch_reading_ease": round(best["fre"], 2),
+                "bert_similarity": round(best["bert"], 4),
+                "balance": round(best["balance"], 2),
+                "targets": {"fre": target_fre, "bert": target_bert}
+            },
+            "dyslexia_friendly": True,
+            "attempts_used": attempts_used
         }), 200
-        
+
     except Exception as e:
         logging.error(f"Summarization error: {e}")
         logging.error(traceback.format_exc())
         return jsonify({"error": "Summary generation failed"}), 500
-
+    
 @app.post("/api/synthesize")
 @jwt_required()
 def synthesize():
@@ -892,7 +959,7 @@ def synthesize():
         MAX_TEXT_LENGTH = 1000
 
         # Dyslexia-friendly controls
-        DEFAULT_SPEED = 0.85  # slower than normal (range 0.7–1.2)
+        DEFAULT_SPEED = 0.91  # slower than normal (range 0.7–1.2)
         requested_speed = body.get("speed")
         try:
             speed = float(requested_speed) if requested_speed is not None else DEFAULT_SPEED

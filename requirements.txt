@@ -6,7 +6,8 @@ gunicorn==21.2.0
 
 # Database - Use psycopg2-binary instead of psycopg2
 psycopg2-binary==2.9.10
-
+bert-score
+sentence-transformers
 # External APIs
 requests==2.31.0
 stripe==6.6.0
