@@ -1,113 +1,153 @@
+# -*- coding: utf-8 -*-
+"""
+LexiSmart Backend (Render-friendly)
+- Auth, Stripe subscriptions, Mindmaps, Analytics
+- Dyslexia-friendly summarizer with iterative optimization
+- TTS via ElevenLabs REST (no SDK)
+- Low memory: no sentence-transformers / bert-score / networkx
+"""
+
 import os
 import io
-import math
 import re
-import textstat
 import json
+import math
 import time
 import hashlib
 import logging
-import tempfile
 import traceback
 from datetime import datetime, timedelta
 from typing import Optional
 
+import requests
+import textstat
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
-import requests
-import networkx as nx
-import stripe
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
+import stripe
+import openai
 
 # -----------------------
 # Bootstrap & Logging
 # -----------------------
 load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("lexismart")
 
 # -----------------------
-# Database Configuration
+# Flask app & CORS
+# -----------------------
+app = Flask(__name__)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+allowed_origins = [o for o in (os.getenv("ALLOWED_ORIGINS", "")).split(",") if o] or [
+    FRONTEND_URL,
+    "https://*.netlify.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+logger.info(f"Allowed CORS origins: {allowed_origins}")
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credentials=True)
+
+# -----------------------
+# Keys / Config
 # -----------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is required")
     raise ValueError("DATABASE_URL is required")
 
-# Initialize connection pool
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET", "fallback_secret_key")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+jwt = JWTManager(app)
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+openai.api_key = OPENAI_API_KEY
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+
+# -----------------------
+# Plans
+# -----------------------
+plans = {
+    "free": {"requests": 25, "price_ids": {}},
+    "Student": {"requests": 200, "price_ids": {"USD": os.getenv("PRICE_ID_STUDENT_INR")}},
+    "Pro": {"requests": 10000, "price_ids": {"USD": os.getenv("PRICE_ID_PRO_INR")}},
+}
+PLAN_ALIASES = {"student": "Student", "pro": "Pro"}
+
+def resolve_plan_key(plan_type: str) -> str:
+    if not plan_type:
+        return ""
+    return PLAN_ALIASES.get(plan_type.strip(), plan_type.strip())
+
+def resolve_plan_by_price_id(price_id: str):
+    for name, p in plans.items():
+        for _, pid in p.get("price_ids", {}).items():
+            if pid and pid == price_id:
+                return name
+    return None
+
+# -----------------------
+# Database (smaller pool)
+# -----------------------
 try:
     db_pool = ThreadedConnectionPool(
         minconn=1,
-        maxconn=10,  # Reduced for Render's free tier
+        maxconn=3,  # keep RAM low on Render free tier
         dsn=DATABASE_URL,
-        cursor_factory=psycopg2.extras.RealDictCursor
+        cursor_factory=psycopg2.extras.RealDictCursor,
     )
     logger.info("Database connection pool initialized")
 except Exception as e:
     logger.error(f"Failed to initialize database pool: {e}")
     raise
 
-# Database helper functions
-
 def get_db_connection():
-    """Get database connection from pool"""
-    try:
-        return db_pool.getconn()
-    except Exception as e:
-        logger.error(f"Failed to get database connection: {e}")
-        raise
+    return db_pool.getconn()
 
 def return_db_connection(conn):
-    """Return database connection to pool"""
     try:
         db_pool.putconn(conn)
     except Exception as e:
-        logger.error(f"Failed to return database connection: {e}")
-
+        logger.error(f"Failed to return DB connection: {e}")
 
 def execute_query(query, params=None, fetch=False, fetch_one=False):
-    """Execute database query with proper connection handling"""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(query, params)
-
         if fetch_one:
             result = cursor.fetchone()
         elif fetch:
             result = cursor.fetchall()
         else:
             result = None
-
         conn.commit()
         return result
     except Exception as e:
         if conn:
             conn.rollback()
-        logger.error(f"Database error: {e}")
-        logger.error(f"Query: {query}")
-        logger.error(f"Params: {params}")
+        logger.error(f"DB error: {e}\nQuery: {query}\nParams: {params}")
         raise
     finally:
         if conn:
             return_db_connection(conn)
 
-
 def init_database():
-    """Initialize database tables"""
     try:
-        # Users table
         execute_query("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -122,13 +162,11 @@ def init_database():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
-
-        # Subscriptions table
         execute_query("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                stripe_subscription_id VARCHAR(255),
+                stripe_subscription_id VARCHAR(255) UNIQUE,
                 stripe_customer_id VARCHAR(255),
                 plan_name VARCHAR(100),
                 status VARCHAR(50),
@@ -138,8 +176,6 @@ def init_database():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
-
-        # Mind maps table
         execute_query("""
             CREATE TABLE IF NOT EXISTS mindmaps (
                 id SERIAL PRIMARY KEY,
@@ -151,8 +187,6 @@ def init_database():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
-
-        # Usage analytics table
         execute_query("""
             CREATE TABLE IF NOT EXISTS usage_analytics (
                 id SERIAL PRIMARY KEY,
@@ -162,127 +196,22 @@ def init_database():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-
-        # Indexes
         execute_query("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
         execute_query("CREATE INDEX IF NOT EXISTS idx_subscriptions_customer_id ON subscriptions(stripe_customer_id);")
         execute_query("CREATE INDEX IF NOT EXISTS idx_mindmaps_user_id ON mindmaps(user_id);")
-
-        logger.info("Database tables initialized successfully")
+        logger.info("Database tables initialized")
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
+        logger.error(f"Failed to initialize DB: {e}")
         raise
 
 # -----------------------
-# Flask app & CORS
+# Common helpers
 # -----------------------
-app = Flask(__name__)
-# Get allowed origins from environment or use defaults
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
-if not allowed_origins or allowed_origins[0] == "":
-    allowed_origins = [
-        FRONTEND_URL, 
-        "https://*.netlify.app",  # Wildcard for Netlify
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ]
-
-# Add this to log CORS configuration
-logger.info(f"Allowed CORS origins: {allowed_origins}")
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": allowed_origins}},
-    supports_credentials=True
-)
-
-# JWT & Stripe
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET", "fallback_secret_key")
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
-jwt = JWTManager(app)
-
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-stripe.api_key = STRIPE_SECRET_KEY
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-
-# External keys
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-# ElevenLabs import variations
-ELEVENLABS_AVAILABLE = False
-try:
-    from elevenlabs import ElevenLabs, VoiceSettings
-    ELEVENLABS_AVAILABLE = True
-except Exception:
-    try:
-        from elevenlabs.client import ElevenLabs
-        from elevenlabs import VoiceSettings
-        ELEVENLABS_AVAILABLE = True
-    except Exception:
-        try:
-            import elevenlabs
-            ELEVENLABS_AVAILABLE = True
-        except Exception:
-            ELEVENLABS_AVAILABLE = False
-            logger.warning("ElevenLabs SDK not available; TTS endpoint will be disabled.")
-
-# OpenAI API
-import openai
-openai.api_key = OPENAI_API_KEY
-
-# Plans
-plans = {
-    "free": {
-        "requests": 25,
-        "price_ids": {}
-    },
-    "Student": {
-        "requests": 200,
-        "price_ids": {
-            "USD": os.getenv("PRICE_ID_STUDENT_INR")
-        }
-    },
-    "Pro": {
-        "requests": 10000,
-        "price_ids": {
-            "USD": os.getenv("PRICE_ID_PRO_INR")
-        }
-    }
-}
-
-PLAN_ALIASES = {
-    "student": "Student",
-    "pro": "Pro",
-}
-
-def resolve_plan_key(plan_type: str) -> str:
-    if not plan_type:
-        return ""
-    return PLAN_ALIASES.get(plan_type.strip(), plan_type.strip())
-
-def resolve_plan_by_price_id(price_id: str):
-    for name, p in plans.items():
-        for _, pid in p.get("price_ids", {}).items():
-            if pid and pid == price_id:
-                return name
-    return None
-
-# More DB helpers
 def get_user_by_email(email):
-    return execute_query(
-        "SELECT * FROM users WHERE email = %s",
-        (email,),
-        fetch_one=True
-    )
+    return execute_query("SELECT * FROM users WHERE email = %s", (email,), fetch_one=True)
 
 def get_user_by_id(user_id):
-    return execute_query(
-        "SELECT * FROM users WHERE id = %s",
-        (user_id,),
-        fetch_one=True
-    )
+    return execute_query("SELECT * FROM users WHERE id = %s", (user_id,), fetch_one=True)
 
 def create_user(email, password_hash, stripe_customer_id=None):
     return execute_query(
@@ -292,7 +221,7 @@ def create_user(email, password_hash, stripe_customer_id=None):
         RETURNING id
         """,
         (email, password_hash, stripe_customer_id, plans["free"]["requests"], datetime.utcnow() + timedelta(days=7)),
-        fetch_one=True
+        fetch_one=True,
     )
 
 def update_user_subscription(user_id, plan_name, request_limit, reset_date=None):
@@ -305,25 +234,20 @@ def update_user_subscription(user_id, plan_name, request_limit, reset_date=None)
             requests_used = 0, updated_at = NOW()
         WHERE id = %s
         """,
-        (plan_name, request_limit, reset_date, user_id)
+        (plan_name, request_limit, reset_date, user_id),
     )
 
 def increment_user_requests(user_id):
-    execute_query(
-        "UPDATE users SET requests_used = requests_used + 1, updated_at = NOW() WHERE id = %s",
-        (user_id,)
-    )
+    execute_query("UPDATE users SET requests_used = requests_used + 1, updated_at = NOW() WHERE id = %s", (user_id,))
 
 def log_usage(user_id, action_type, metadata=None):
     try:
         execute_query(
             "INSERT INTO usage_analytics (user_id, action_type, metadata) VALUES (%s, %s, %s)",
-            (user_id, action_type, json.dumps(metadata) if metadata else None)
+            (user_id, action_type, json.dumps(metadata) if metadata else None),
         )
     except Exception as e:
         logger.warning(f"Failed to log usage: {e}")
-
-# Password hashing
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -331,7 +255,9 @@ def hash_password(password):
 def verify_password(password, password_hash):
     return hash_password(password) == password_hash
 
-# Health endpoints
+# -----------------------
+# Health
+# -----------------------
 @app.route("/", methods=["GET", "HEAD"])
 def root():
     return jsonify(status="ok"), 200
@@ -349,19 +275,19 @@ def health_check():
         "database": db_status,
         "openai_configured": bool(OPENAI_API_KEY),
         "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
-        "elevenlabs_available": ELEVENLABS_AVAILABLE,
         "stripe_configured": bool(STRIPE_SECRET_KEY),
         "allowed_origins": allowed_origins
     }), 200
 
-# Registration and authentication
+# -----------------------
+# Auth
+# -----------------------
 @app.post("/api/register")
 def register_post():
     try:
         data = request.get_json() or {}
         email = data.get("email", "").strip().lower()
         password = data.get("password", "").strip()
-
         if not email or not password:
             return jsonify({"error": "Email and password are required"}), 400
         if len(password) < 6:
@@ -374,19 +300,20 @@ def register_post():
             return jsonify({"error": "An account with this email already exists"}), 400
 
         stripe_customer_id = None
-        try:
-            customer = stripe.Customer.create(email=email)
-            stripe_customer_id = customer.id
-            logger.info(f"Created Stripe customer {stripe_customer_id} for {email}")
-        except stripe.error.StripeError as e:
-            logger.error(f"Stripe customer creation failed: {e}")
+        if STRIPE_SECRET_KEY:
+            try:
+                customer = stripe.Customer.create(email=email)
+                stripe_customer_id = customer.id
+                logger.info(f"Created Stripe customer {stripe_customer_id} for {email}")
+            except stripe.error.StripeError as e:
+                logger.error(f"Stripe customer creation failed: {e}")
 
         password_hash = hash_password(password)
         user_result = create_user(email, password_hash, stripe_customer_id)
         if not user_result:
             return jsonify({"error": "Failed to create user account"}), 500
 
-        logger.info(f"User registered successfully: {email}")
+        logger.info(f"User registered: {email}")
         return jsonify({"message": "Account created successfully! Please login."}), 201
 
     except Exception as e:
@@ -400,25 +327,16 @@ def login():
         data = request.get_json() or {}
         email = data.get("email", "").strip().lower()
         password = data.get("password", "").strip()
-
         if not email or not password:
             return jsonify({"error": "Email and password are required"}), 400
 
         user = get_user_by_email(email)
-        if not user:
-            return jsonify({"error": "Invalid email or password"}), 401
-
-        if not verify_password(password, user["password_hash"]):
+        if not user or not verify_password(password, user["password_hash"]):
             return jsonify({"error": "Invalid email or password"}), 401
 
         log_usage(user["id"], "login")
+        access_token = create_access_token(identity=str(user["id"]), expires_delta=timedelta(hours=24))
 
-        access_token = create_access_token(
-            identity=str(user["id"]),
-            expires_delta=timedelta(hours=24)
-        )
-
-        logger.info(f"User logged in successfully: {email}")
         return jsonify({
             "access_token": access_token,
             "user": {
@@ -452,12 +370,13 @@ def get_user():
             "request_limit": user["request_limit"],
             "reset_date": user["reset_date"].isoformat() if user["reset_date"] else None
         }), 200
-
     except Exception as e:
         logger.error(f"Get user error: {e}")
         return jsonify({"error": "Failed to fetch user data"}), 500
 
-# Payment health and config
+# -----------------------
+# Stripe
+# -----------------------
 @app.get("/api/payment-health")
 def payment_health():
     status = {
@@ -480,7 +399,6 @@ def payment_health():
             status["stripe_connection"] = f"Error: {e}"
     else:
         status["stripe_connection"] = "Not configured"
-
     return jsonify(status), 200
 
 @app.get("/api/payment-config")
@@ -495,17 +413,12 @@ def payment_config():
             price = stripe.Price.retrieve(pid)
             amount_major = (price["unit_amount"] or 0) / 100.0
             interval = price.get("recurring", {}).get("interval", "month")
-            out["plans"][key] = {
-                "amount": amount_major,
-                "interval": interval,
-                "price_id": pid
-            }
+            out["plans"][key] = {"amount": amount_major, "interval": interval, "price_id": pid}
         except Exception as e:
             logger.error(f"Failed to fetch price {pid}: {e}")
             out["plans"][key] = {"amount": None, "interval": "month", "price_id": pid}
     return jsonify(out), 200
 
-# Subscription creation
 @app.post("/api/create-subscription")
 @jwt_required()
 def create_subscription():
@@ -518,25 +431,21 @@ def create_subscription():
         data = request.get_json() or {}
         plan_input = data.get("plan")
         plan_key = resolve_plan_key(plan_input)
-
-        logger.info(f"Creating subscription for user {user_id}: plan_input={plan_input} -> plan_key={plan_key}")
+        logger.info(f"Creating subscription for user {user_id}: {plan_input} -> {plan_key}")
 
         if plan_key not in plans or plan_key == "free":
             return jsonify({"error": f"Invalid plan: {plan_input}"}), 400
 
         price_id = plans[plan_key]["price_ids"].get("USD")
         if not price_id:
-            return jsonify({"error": f"Price ID (INR) not configured for plan {plan_key}"}), 500
+            return jsonify({"error": f"Price ID (USD) not configured for plan {plan_key}"}), 500
 
-        customer_id = user["stripe_customer_id"]
+        customer_id = user.get("stripe_customer_id")
         if not customer_id:
             try:
                 customer = stripe.Customer.create(email=user["email"])
                 customer_id = customer.id
-                execute_query(
-                    "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
-                    (customer_id, user_id)
-                )
+                execute_query("UPDATE users SET stripe_customer_id = %s WHERE id = %s", (customer_id, user_id))
                 logger.info(f"Created Stripe customer {customer_id} for existing user")
             except stripe.error.StripeError as e:
                 logger.error(f"Failed to create Stripe customer: {e}")
@@ -545,16 +454,9 @@ def create_subscription():
             try:
                 stripe.Customer.retrieve(customer_id)
             except stripe.error.InvalidRequestError:
-                try:
-                    customer = stripe.Customer.create(email=user["email"])
-                    customer_id = customer.id
-                    execute_query(
-                        "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
-                        (customer_id, user_id)
-                    )
-                except stripe.error.StripeError as e:
-                    logger.error(f"Failed to recreate Stripe customer: {e}")
-                    return jsonify({"error": "Payment system error"}), 500
+                customer = stripe.Customer.create(email=user["email"])
+                customer_id = customer.id
+                execute_query("UPDATE users SET stripe_customer_id = %s WHERE id = %s", (customer_id, user_id))
 
         try:
             session = stripe.checkout.Session.create(
@@ -565,33 +467,21 @@ def create_subscription():
                 cancel_url=f"{FRONTEND_URL}/cancel",
                 allow_promotion_codes=True,
                 billing_address_collection="required",
-                metadata={
-                    "user_id": user_id,
-                    "user_email": user["email"],
-                    "plan_type": plan_key
-                },
-                client_reference_id=str(user_id)
+                metadata={"user_id": user_id, "user_email": user["email"], "plan_type": plan_key},
+                client_reference_id=str(user_id),
             )
-            logger.info(f"Checkout session created: {session.id} for user {user_id}")
             log_usage(int(user_id), "subscription_checkout_created", {"plan": plan_key, "session_id": session.id})
-            return jsonify({"sessionId": session.id, "currency_used": "INR"}), 200
+            return jsonify({"sessionId": session.id, "currency_used": "USD"}), 200
         except stripe.error.StripeError as e:
             msg = getattr(e, "user_message", "") or str(e)
             logger.error(f"Stripe error creating session: {msg}")
-            if isinstance(e, stripe.error.InvalidRequestError):
-                return jsonify({"error": f"Invalid payment request: {msg}"}), 400
-            elif isinstance(e, stripe.error.AuthenticationError):
-                return jsonify({"error": "Payment system authentication failed"}), 500
-            elif isinstance(e, stripe.error.APIConnectionError):
-                return jsonify({"error": "Payment system temporarily unavailable"}), 503
-            else:
-                return jsonify({"error": f"Payment processing failed: {msg}"}), 500
+            return jsonify({"error": f"Payment processing failed: {msg}"}), 500
+
     except Exception as e:
         logger.error(f"Subscription creation error: {e}")
         logger.error(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
 
-# Webhook handler
 @app.post("/api/stripe-webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -600,7 +490,6 @@ def stripe_webhook():
 
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
-
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         logger.info(f"Webhook event received: {event['type']}")
@@ -627,8 +516,6 @@ def stripe_webhook():
         logger.error(f"Webhook processing error: {e}")
         logger.error(traceback.format_exc())
         return jsonify({"error": "Webhook processing failed"}), 500
-
-# Helper functions for Stripe events
 
 def handle_checkout_completed(session):
     try:
@@ -664,8 +551,6 @@ def handle_subscription_deleted(subscription):
     except Exception as e:
         logger.error(f"Error handling subscription deletion: {e}")
 
-# Subscription state application
-
 def apply_subscription_state(customer_id: str, subscription: dict):
     try:
         price_id = subscription["items"]["data"][0]["price"]["id"]
@@ -673,11 +558,7 @@ def apply_subscription_state(customer_id: str, subscription: dict):
         if not plan_name:
             logger.error(f"Unknown price ID in subscription: {price_id}")
             return
-        user = execute_query(
-            "SELECT id FROM users WHERE stripe_customer_id = %s",
-            (customer_id,),
-            fetch_one=True
-        )
+        user = execute_query("SELECT id FROM users WHERE stripe_customer_id = %s", (customer_id,), fetch_one=True)
         if not user:
             logger.warning(f"No user found for Stripe customer {customer_id}")
             return
@@ -704,8 +585,8 @@ def apply_subscription_state(customer_id: str, subscription: dict):
                 plan_name,
                 subscription["status"],
                 datetime.utcfromtimestamp(subscription.get("current_period_start", 0)),
-                reset_date
-            )
+                reset_date,
+            ),
         )
         log_usage(user_id, "subscription_activated", {"plan": plan_name})
         logger.info(f"User {user_id} upgraded to {plan_name}")
@@ -713,14 +594,9 @@ def apply_subscription_state(customer_id: str, subscription: dict):
         logger.error(f"Error applying subscription state: {e}")
         logger.error(traceback.format_exc())
 
-
 def downgrade_to_free(customer_id: str):
     try:
-        user = execute_query(
-            "SELECT id FROM users WHERE stripe_customer_id = %s",
-            (customer_id,),
-            fetch_one=True
-        )
+        user = execute_query("SELECT id FROM users WHERE stripe_customer_id = %s", (customer_id,), fetch_one=True)
         if not user:
             logger.warning(f"No user found for Stripe customer {customer_id}")
             return
@@ -731,63 +607,48 @@ def downgrade_to_free(customer_id: str):
     except Exception as e:
         logger.error(f"Error downgrading user: {e}")
 
-import re
-import logging
-import traceback
-
-import io
-
-# ---------------- Configuration ----------------
+# -----------------------
+# Dyslexia-friendly summarizer
+# -----------------------
 class DyslexiaFriendlyConfig:
-    # Only used for model response budget, not for line breaking (we removed the formatter)
     SUMMARY_MAX_TOKENS = 300
 
-# ---------------- Metric helpers ----------------
-_ST_MODEL = None  # cached SentenceTransformer model
-
 def flesch_reading_ease(text: str) -> float:
-    """Return Flesch Reading Ease in [0, 100]."""
     try:
         fre = float(textstat.flesch_reading_ease(text))
         return max(0.0, min(100.0, fre))
     except Exception:
         return 0.0
 
-def try_bertscore(candidate: str, source: str) -> Optional[float]:
-    """Try BERTScore F1 (0..1). Return None if unavailable or errors."""
-    try:
-        from bert_score import score as bert_score
-        P, R, F1 = bert_score([candidate], [source], lang="en", rescale_with_baseline=True)
-        return float(F1[0].item())
-    except Exception:
-        return None
+def _cosine(a, b):
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
 
-def fallback_semantic_sim(candidate: str, source: str) -> float:
-    """Fallback to Sentence-Transformers cosine similarity (0..1)."""
-    global _ST_MODEL
-    try:
-        from sentence_transformers import SentenceTransformer, util
-        if _ST_MODEL is None:
-            _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-        emb = _ST_MODEL.encode([candidate, source], convert_to_tensor=True, normalize_embeddings=True)
-        sim = util.cos_sim(emb[0], emb[1]).item()
-        # emb are normalized; sim should already be in [0,1], but clamp anyway
-        return max(0.0, min(1.0, float(sim)))
-    except Exception:
-        # Last resort: neutral-ish score to avoid total failure
-        return 0.5
+def _embed(text: str) -> list[float]:
+    # Uses small/cheap model; truncate long inputs
+    resp = openai.Embedding.create(model="text-embedding-3-small", input=text[:8000])
+    return resp["data"][0]["embedding"]
 
 def semantic_score(candidate: str, source: str) -> float:
-    """Preferred: BERTScore F1; fallback to ST cosine similarity. Returns 0..1."""
-    bs = try_bertscore(candidate, source)
-    return bs if bs is not None else fallback_semantic_sim(candidate, source)
+    """Cosine similarity of OpenAI embeddings, mapped to [0,1]."""
+    try:
+        ec = _embed(candidate)
+        es = _embed(source)
+        sim = _cosine(ec, es)
+        return float(max(0.0, min(1.0, sim)))
+    except Exception:
+        # light fallback: token overlap
+        cand = set(re.findall(r"\b\w+\b", candidate.lower()))
+        src = set(re.findall(r"\b\w+\b", source.lower()))
+        inter = len(cand & src)
+        return (inter / max(1, len(cand))) ** 0.5
 
-def balance_score(fre: float, bert: float) -> float:
-    """Combine metrics as 0.5*FRE + 0.5*(BERT*100)."""
-    return 0.5 * fre + 0.5 * (bert * 100.0)
+def balance_score(fre: float, bert_like: float) -> float:
+    return 0.5 * fre + 0.5 * (bert_like * 100.0)
 
-# ---------------- Prompt builder ----------------
-def create_summary_prompt(text: str, target_fre: int, target_bert: float) -> str:
+def create_summary_prompt(text: str, target_fre: int, target_sim: float) -> str:
     return f"""
 You are a skilled editor for dyslexic readers.
 
@@ -800,7 +661,7 @@ Write a concise, engaging summary with:
 
 Quality targets you should aim for:
 - Flesch Reading Ease ≥ {target_fre}
-- High meaning preservation (BERT-like similarity ≥ {target_bert})
+- High meaning preservation (similarity ≥ {target_sim})
 
 Structure:
 1) What happened
@@ -817,18 +678,12 @@ Article:
 {text}
 """
 
-# ---------------- Route ----------------
-# Note: ensure `app` is already created in your actual project.
-
-
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
 def summarize():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-
     try:
-        # -------- Input text --------
         if request.method == "GET":
             input_text = (request.args.get("text") or "").strip()
             post_json = {}
@@ -839,11 +694,9 @@ def summarize():
         if not input_text:
             return jsonify({"error": "No text provided"}), 400
 
-        # Bound extremely long input (cost control)
         if len(input_text) > 20000:
             input_text = input_text[:20000] + " [TEXT TRUNCATED]"
 
-        # -------- Auth & limits --------
         user_id = get_jwt_identity()
         user = None
         if user_id:
@@ -856,92 +709,84 @@ def summarize():
                     "upgrade_url": f"{FRONTEND_URL}/upgrade"
                 }), 402
 
-        # -------- Targets / knobs (optional overrides via POST) --------
         target_fre = int(post_json.get("target_fre", 85))
-        target_bert = float(post_json.get("target_bert", 0.85))
-        max_attempts = int(post_json.get("max_attempts", 4))
+        target_sim = float(post_json.get("target_bert", 0.85))  # name kept for compatibility
+        max_attempts = int(post_json.get("max_attempts", 3))
 
-        # -------- Build initial prompt --------
         system_msg = {"role": "system", "content": "You are a careful editor optimizing readability and meaning."}
-        base_user_prompt = create_summary_prompt(input_text, target_fre, target_bert)
+        base_user_prompt = create_summary_prompt(input_text, target_fre, target_sim)
         messages = [system_msg, {"role": "user", "content": base_user_prompt}]
 
-        best = {"text": None, "fre": -1.0, "bert": -1.0, "balance": -math.inf}
+        best = {"text": None, "fre": -1.0, "sim": -1.0, "balance": -math.inf}
         attempts_used = 0
 
         for attempt in range(1, max_attempts + 1):
             attempts_used = attempt
-            # --- Generate candidate ---
             resp = openai.ChatCompletion.create(
                 model="gpt-4o",
                 messages=messages,
-                temperature=0.4,  # steadier phrasing; raise to 0.5–0.6 if too rigid
-                max_tokens=DyslexiaFriendlyConfig.SUMMARY_MAX_TOKENS
+                temperature=0.4,
+                max_tokens=DyslexiaFriendlyConfig.SUMMARY_MAX_TOKENS,
             )
             candidate = (resp.choices[0].message.content or "").strip()
 
-            # --- Score candidate ---
             fre = flesch_reading_ease(candidate)
-            bert = semantic_score(candidate, input_text)
-            bal = balance_score(fre, bert)
+            sim = semantic_score(candidate, input_text)
+            bal = balance_score(fre, sim)
 
-            # Track best
             if bal > best["balance"]:
-                best.update({"text": candidate, "fre": fre, "bert": bert, "balance": bal})
+                best.update({"text": candidate, "fre": fre, "sim": sim, "balance": bal})
 
-            # Early stop if both targets met
-            if fre >= target_fre and bert >= target_bert:
+            if fre >= target_fre and sim >= target_sim:
                 break
 
-            # --- Feedback loop ---
             tweaks = []
             if fre < target_fre:
                 tweaks.append(f"raise FRE to ≥ {target_fre} by using simpler words and slightly shorter sentences")
-            if bert < target_bert:
-                tweaks.append(f"increase meaning preservation to ≥ {target_bert} by keeping all key facts and names")
-            tweak_text = "; ".join(tweaks) if tweaks else "refine flow to improve both readability and meaning"
+            if sim < target_sim:
+                tweaks.append(f"increase meaning preservation to ≥ {target_sim} by keeping all key facts and names")
+            tweak_text = "; ".join(tweaks) if tweaks else "refine flow to improve readability and meaning"
 
             feedback = (
-                f"Scores now: FRE={fre:.1f}, SIM={bert:.3f}, BAL={bal:.1f}. "
+                f"Scores now: FRE={fre:.1f}, SIM={sim:.3f}, BAL={bal:.1f}. "
                 f"Revise to {tweak_text}. Keep 90–140 words, cohesive tone, no bullets, no headings."
             )
-
-            # Continue conversation with explicit feedback
             messages.append({"role": "assistant", "content": candidate})
             messages.append({"role": "user", "content": feedback})
 
         final_text = best["text"] or "Summary unavailable."
 
-        # -------- Usage logging --------
         if user_id:
             increment_user_requests(int(user_id))
             log_usage(int(user_id), "summarize", {
                 "text_length": len(input_text),
                 "attempts": attempts_used,
                 "fre": best["fre"],
-                "bert": best["bert"],
+                "similarity": best["sim"],
                 "balance": best["balance"],
-                "targets": {"fre": target_fre, "bert": target_bert},
+                "targets": {"fre": target_fre, "similarity": target_sim},
             })
 
-        # -------- Response --------
         return jsonify({
             "summary_text": final_text,
             "scores": {
                 "flesch_reading_ease": round(best["fre"], 2),
-                "bert_similarity": round(best["bert"], 4),
+                "similarity": round(best["sim"], 4),
                 "balance": round(best["balance"], 2),
-                "targets": {"fre": target_fre, "bert": target_bert}
+                "targets": {"fre": target_fre, "similarity": target_sim}
             },
             "dyslexia_friendly": True,
             "attempts_used": attempts_used
         }), 200
 
     except Exception as e:
-        logging.error(f"Summarization error: {e}")
-        logging.error(traceback.format_exc())
+        logger.error(f"Summarization error: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({"error": "Summary generation failed"}), 500
-    
+
+# -----------------------
+# TTS (ElevenLabs REST)
+# -----------------------
 @app.post("/api/synthesize")
 @jwt_required()
 def synthesize():
@@ -949,7 +794,6 @@ def synthesize():
         user_id = get_jwt_identity()
         body = request.get_json() or {}
         text = (body.get("text") or "").strip()
-
         if not text:
             return jsonify({"error": "No text provided"}), 400
         if not ELEVENLABS_API_KEY:
@@ -957,76 +801,44 @@ def synthesize():
 
         VOICE_ID = "ZT9u07TYPVl83ejeLakq"  # Rachel
         MAX_TEXT_LENGTH = 1000
+        if len(text) > MAX_TEXT_LENGTH:
+            text = text[:MAX_TEXT_LENGTH]
 
-        # Dyslexia-friendly controls
-        DEFAULT_SPEED = 0.91  # slower than normal (range 0.7–1.2)
-        requested_speed = body.get("speed")
+        DEFAULT_SPEED = 0.9
+        speed = body.get("speed", DEFAULT_SPEED)
         try:
-            speed = float(requested_speed) if requested_speed is not None else DEFAULT_SPEED
+            speed = float(speed)
         except (TypeError, ValueError):
             speed = DEFAULT_SPEED
-        # clamp to supported range
         speed = max(0.7, min(1.2, speed))
 
         add_pauses = bool(body.get("add_pauses", False))
-        pause_seconds = float(body.get("pause_seconds", 0.6))  # between 0.3–1.5 usually sounds natural
+        pause_seconds = float(body.get("pause_seconds", 0.6))
 
-        # If using SSML pauses, switch to an SSML-capable model
-        # (Flash v2.5 / Turbo v2.5 / English v1; see docs)
-        # Otherwise keep your current model.
         if add_pauses:
             model_id = "eleven_turbo_v2_5"
-            # Insert short SSML pauses between sentences.
-            # Keep it conservative to avoid artifacts.
-            import re as _re
-            sent_split = _re.sub(r'([.!?])(\s+)', r'\1 <break time="{:.1f}s" /> '.format(pause_seconds), text)
+            sent_split = re.sub(r'([.!?])(\s+)', r'\1 <break time="%.1fs" /> ' % pause_seconds, text)
             text_payload = f"<speak>{sent_split}</speak>"
         else:
-            model_id = "eleven_monolingual_v1"  # your original
+            model_id = "eleven_monolingual_v1"
             text_payload = text
 
-        if len(text_payload) > MAX_TEXT_LENGTH:
-            text_payload = text_payload[:MAX_TEXT_LENGTH]
-
-        ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY
-        }
-
+        headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVENLABS_API_KEY}
         payload = {
             "text": text_payload,
             "model_id": model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "speed": speed  # <-- key change for slower TTS
-            }
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": speed},
         }
-
-        # Enable SSML parsing when we included SSML tags
         if add_pauses:
             payload["enable_ssml_parsing"] = True
 
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
         try:
-            response = requests.post(ELEVENLABS_URL, json=payload, headers=headers, timeout=15)
-            response.raise_for_status()
-            audio_bytes = response.content
-
-            log_usage(int(user_id), "tts", {
-                "text_length": len(text),
-                "speed": speed,
-                "add_pauses": add_pauses
-            })
-
-            return send_file(
-                io.BytesIO(audio_bytes),
-                mimetype="audio/mpeg",
-                as_attachment=False,
-                download_name="lexismart_audio.mp3"
-            )
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            resp.raise_for_status()
+            audio_bytes = resp.content
+            log_usage(int(user_id), "tts", {"text_length": len(text), "speed": speed, "add_pauses": add_pauses})
+            return send_file(io.BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False, download_name="lexismart_audio.mp3")
         except Exception as e:
             logger.error(f"TTS API error: {e}")
             return jsonify({"error": "Voice generation failed. Please try again."}), 500
@@ -1035,31 +847,25 @@ def synthesize():
         logger.error(f"TTS system error: {e}")
         return jsonify({"error": "Voice service unavailable"}), 500
 
+# -----------------------
 # Mind Map Storage
+# -----------------------
 @app.post("/api/save-mindmap")
 @jwt_required()
 def save_mindmap():
     try:
         user_id = get_jwt_identity()
         data = request.get_json() or {}
-        
         title = data.get("title", "Untitled Mind Map")
         nodes = data.get("nodes", [])
         edges = data.get("edges", [])
-        
         execute_query(
-            """
-            INSERT INTO mindmaps (user_id, title, nodes_data, edges_data)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-            """,
+            "INSERT INTO mindmaps (user_id, title, nodes_data, edges_data) VALUES (%s, %s, %s, %s) RETURNING id",
             (int(user_id), title, json.dumps(nodes), json.dumps(edges)),
-            fetch_one=True
+            fetch_one=True,
         )
-        
         log_usage(int(user_id), "mindmap_saved", {"nodes_count": len(nodes)})
         return jsonify({"message": "Mind map saved successfully"}), 200
-        
     except Exception as e:
         logger.error(f"Save mindmap error: {e}")
         return jsonify({"error": "Failed to save mind map"}), 500
@@ -1069,30 +875,22 @@ def save_mindmap():
 def get_mindmaps():
     try:
         user_id = get_jwt_identity()
-        
         mindmaps = execute_query(
             """
             SELECT id, title, created_at, updated_at
-            FROM mindmaps 
-            WHERE user_id = %s 
-            ORDER BY updated_at DESC
+            FROM mindmaps WHERE user_id = %s ORDER BY updated_at DESC
             """,
             (int(user_id),),
-            fetch=True
+            fetch=True,
         )
-        
         return jsonify({
-            "mindmaps": [
-                {
-                    "id": mm["id"],
-                    "title": mm["title"],
-                    "created_at": mm["created_at"].isoformat(),
-                    "updated_at": mm["updated_at"].isoformat()
-                }
-                for mm in mindmaps
-            ]
+            "mindmaps": [{
+                "id": mm["id"],
+                "title": mm["title"],
+                "created_at": mm["created_at"].isoformat(),
+                "updated_at": mm["updated_at"].isoformat()
+            } for mm in mindmaps]
         }), 200
-        
     except Exception as e:
         logger.error(f"Get mindmaps error: {e}")
         return jsonify({"error": "Failed to fetch mind maps"}), 500
@@ -1102,133 +900,29 @@ def get_mindmaps():
 def get_mindmap(mindmap_id):
     try:
         user_id = get_jwt_identity()
-        
         mindmap = execute_query(
-            """
-            SELECT nodes_data, edges_data, title
-            FROM mindmaps 
-            WHERE id = %s AND user_id = %s
-            """,
+            "SELECT nodes_data, edges_data, title FROM mindmaps WHERE id = %s AND user_id = %s",
             (mindmap_id, int(user_id)),
-            fetch_one=True
+            fetch_one=True,
         )
-        
         if not mindmap:
             return jsonify({"error": "Mind map not found"}), 404
-            
         return jsonify({
             "title": mindmap["title"],
             "nodes": mindmap["nodes_data"],
             "edges": mindmap["edges_data"]
         }), 200
-        
     except Exception as e:
         logger.error(f"Get mindmap error: {e}")
         return jsonify({"error": "Failed to fetch mind map"}), 500
 
-# Related concepts
-graph = nx.DiGraph()
-CONCEPTNET_API = "https://api.conceptnet.io/query?node=/c/en/{}&rel=/r/RelatedTo&limit=20"
-DBPEDIA_API = "http://dbpedia.org/sparql"
-WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-
-concept_relations = {}
-
+# -----------------------
+# Simple Entity Extraction
+# -----------------------
 def simple_entity_extraction(text):
-    entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+    # Very light heuristic capitalized-phrase finder
+    entities = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text)
     return list(set(entities))
-
-def fetch_conceptnet_relations(concept):
-    try:
-        url = CONCEPTNET_API.format(concept.replace(" ", "_").lower())
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        related = set()
-        for edge in data.get("edges", []):
-            if "end" in edge and "label" in edge["end"]:
-                end_node = edge["end"]["label"]
-                related.add(end_node)
-                graph.add_edge(concept, end_node)
-        return list(related)
-    except Exception as e:
-        logger.error(f"ConceptNet error: {e}")
-        return []
-
-def fetch_dbpedia_relations(concept):
-    try:
-        query = f"""
-        SELECT ?related WHERE {{
-            <http://dbpedia.org/resource/{concept.replace(' ', '_')}> dbo:wikiPageWikiLink ?related .
-        }} LIMIT 20
-        """
-        params = {"query": query, "format": "json"}
-        r = requests.get(DBPEDIA_API, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        related = set()
-        for res in data.get("results", {}).get("bindings", []):
-            if "related" in res and "value" in res["related"]:
-                related_concept = res["related"]["value"].split("/")[-1].replace("_", " ")
-                related.add(related_concept)
-                graph.add_edge(concept, related_concept)
-        return list(related)
-    except Exception as e:
-        logger.error(f"DBPedia error: {e}")
-        return []
-
-def fetch_wikidata_relations(concept):
-    try:
-        params = {"action": "wbsearchentities", "search": concept, "language": "en", "format": "json"}
-        r = requests.get(WIKIDATA_API, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        related = set()
-        for ent in data.get("search", []):
-            if "label" in ent:
-                related.add(ent["label"])
-                graph.add_edge(concept, ent["label"])
-        return list(related)
-    except Exception as e:
-        logger.error(f"Wikidata error: {e}")
-        return []
-
-def expand_concept_dataset(concept):
-    if concept in concept_relations:
-        return concept_relations[concept]
-    related = fetch_conceptnet_relations(concept) + fetch_dbpedia_relations(concept) + fetch_wikidata_relations(concept)
-    concept_relations[concept] = related
-    return related
-
-@app.post("/api/related-concepts")
-@jwt_required()
-def related_concepts():
-    try:
-        user_id = get_jwt_identity()
-        data = request.get_json() or {}
-        concept = (data.get("concept") or "").strip()
-        
-        if not concept:
-            return jsonify({"error": "No concept provided"}), 400
-            
-        related = expand_concept_dataset(concept)[:10]
-        log_usage(int(user_id), "related_concepts", {"concept": concept})
-        
-        return jsonify({"concept": concept, "related_concepts": related}), 200
-        
-    except Exception as e:
-        logger.error(f"Related concepts error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
-@app.get("/api/mindmap-graph")
-def get_mindmap_graph():
-    try:
-        nodes = [{"id": node} for node in graph.nodes]
-        edges = [{"source": s, "target": t} for s, t in graph.edges]
-        return jsonify({"nodes": nodes, "edges": edges}), 200
-    except Exception as e:
-        logger.error(f"Mindmap graph error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
 
 @app.post("/api/extract-entities")
 @jwt_required()
@@ -1237,119 +931,93 @@ def extract_entities():
         user_id = get_jwt_identity()
         data = request.get_json() or {}
         text = (data.get("text") or "").strip()
-        
         if not text:
             return jsonify({"error": "No text provided"}), 400
-            
         entities = simple_entity_extraction(text)
         log_usage(int(user_id), "entity_extraction", {"entities_count": len(entities)})
-        
         return jsonify({"entities": entities}), 200
-        
     except Exception as e:
         logger.error(f"Entity extraction error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-# Analytics endpoint
+# -----------------------
+# Analytics
+# -----------------------
 @app.get("/api/analytics")
 @jwt_required()
 def get_analytics():
     try:
         user_id = get_jwt_identity()
-        
-        # Get usage stats for the user
         stats = execute_query(
             """
-            SELECT 
-                action_type,
-                COUNT(*) as count,
-                DATE(created_at) as date
-            FROM usage_analytics 
-            WHERE user_id = %s 
-                AND created_at >= NOW() - INTERVAL '30 days'
+            SELECT action_type, COUNT(*) as count, DATE(created_at) as date
+            FROM usage_analytics
+            WHERE user_id = %s AND created_at >= NOW() - INTERVAL '30 days'
             GROUP BY action_type, DATE(created_at)
             ORDER BY date DESC
             """,
             (int(user_id),),
-            fetch=True
+            fetch=True,
         )
-        
-        return jsonify({"usage_stats": [
-            {
-                "action": stat["action_type"],
-                "count": stat["count"],
-                "date": stat["date"].isoformat()
-            }
-            for stat in stats
-        ]}), 200
-        
+        return jsonify({"usage_stats": [{
+            "action": s["action_type"],
+            "count": s["count"],
+            "date": s["date"].isoformat()
+        } for s in stats]}), 200
     except Exception as e:
         logger.error(f"Analytics error: {e}")
         return jsonify({"error": "Failed to fetch analytics"}), 500
 
-# Environment Validation
+# -----------------------
+# Environment validation & startup
+# -----------------------
 def validate_environment() -> bool:
-    """Validate required environment variables"""
     required = {
         "DATABASE_URL": DATABASE_URL,
-        "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
-        "PRICE_ID_STUDENT_INR": plans["Student"]["price_ids"].get("USD"),
-        "PRICE_ID_PRO_INR": plans["Pro"]["price_ids"].get("USD"),
         "FRONTEND_URL": FRONTEND_URL,
         "JWT_SECRET": os.getenv("JWT_SECRET"),
-        "OPENAI_API_KEY": OPENAI_API_KEY
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+        # Stripe keys optional for non-payment flows:
+        "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY or "(optional)",
     }
-    
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        logger.error(f"Missing required environment variables: {missing}")
+    missing = [k for k, v in required.items() if not v or v == "(optional)"]
+    if "OPENAI_API_KEY" in missing or "DATABASE_URL" in missing:
+        logger.error(f"Missing required envs: {missing}")
         return False
-    
-    # Test database connection
+
     try:
         execute_query("SELECT 1", fetch_one=True)
         logger.info("Database connection validated")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         return False
-    
-    # Test Stripe API
-    try:
-        stripe.Account.retrieve()
-        logger.info("Stripe API key validated")
-    except stripe.error.AuthenticationError:
-        logger.error("Invalid Stripe API key")
-        return False
-    except Exception as e:
-        logger.error(f"Stripe validation error: {e}")
-        return False
-    
+
+    if STRIPE_SECRET_KEY:
+        try:
+            stripe.Account.retrieve()
+            logger.info("Stripe API key validated")
+        except stripe.error.AuthenticationError:
+            logger.error("Invalid Stripe API key")
+            return False
+        except Exception as e:
+            logger.error(f"Stripe validation warning: {e}")
+
     return True
 
-# -----------------------
-# Application Startup
-# -----------------------
 if __name__ in ("__main__", "app"):
     try:
         if not validate_environment():
-            logger.error("Environment validation failed. Please check your configuration.")
-            exit(1)
-        
-        # Initialize database tables
+            logger.error("Environment validation failed. Check configuration.")
+            raise SystemExit(1)
         init_database()
-        logger.info("Database initialized successfully")
-        
         logger.info("LexiSmart backend started successfully")
-        
     except Exception as e:
-        logger.error(f"Failed to start application: {e}")
+        logger.error(f"Startup error: {e}")
         logger.error(traceback.format_exc())
-        exit(1)
+        raise SystemExit(1)
 
-# -----------------------
-# Local Development
-# -----------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_ENV") == "development"
+    # If deploying with gunicorn on Render, also set WEB_CONCURRENCY=1
     app.run(host="0.0.0.0", port=port, debug=debug)
