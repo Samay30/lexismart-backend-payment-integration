@@ -1010,9 +1010,9 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
             "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
             "- Keep sentences 4–8 words\n"
             "- Prefer one-syllable words\n"
-            "- Use bullets or numbered points\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
+            "- Make sure sentences are cohesive and there is a narrative flow"
             
         ),
         # Attempt 1: Problem/Solution format
@@ -1020,9 +1020,9 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
             "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
             "- Keep sentences 4–8 words\n"
             "- Prefer one-syllable words\n"
-            "- Use bullets or numbered points\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
+            "- Make sure sentences are cohesive and there is a narrative flow"
             
         ),
         # Attempt 2: Timeline format
@@ -1030,9 +1030,9 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
             "- Keep sentences 4–8 words\n"
             "- Prefer one-syllable words\n"
-            "- Use bullets or numbered points\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
+            "- Make sure sentences are cohesive and there is a narrative flow"
            
         )
     ]
