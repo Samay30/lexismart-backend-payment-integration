@@ -729,319 +729,79 @@ def downgrade_to_free(customer_id: str):
         logger.error(f"Error downgrading user: {e}")
 
 import re
-import time
 import logging
 import traceback
-from flask import request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask import request, jsonify, send_file
 import openai
+import requests
+import io
 
-# Dyslexia-focused configuration
+# Configuration for dyslexia-friendly formatting
 class DyslexiaFriendlyConfig:
-    CONTROLLER_MAX_TRIES = 4
-    REQUEST_DELAY = 0.5
-    
-    # Readability targets
-    TARGET_FRE_MIN = 95.0
-    TARGET_AVG_SENTLEN_MAX = 6.0
-    TARGET_SYLL_PER_WORD_MAX = 1.2
-    
-    # Semantic quality floor
-    MIN_ROUGE_L = 0.20
-    
-    # Narrative coherence
-    MIN_CAUSAL_CONNECTIONS = 1
-    MIN_TEMPORAL_MARKERS = 1
-    
-    # Scoring weights
-    BALANCE_W_READABILITY = 0.5
-    BALANCE_W_SEMANTICS = 0.25
-    BALANCE_W_COHERENCE = 0.25
-    
-    # Dyslexia formatting
     MAX_SENTENCE_LENGTH = 8
     MAX_PARAGRAPH_LENGTH = 3
-    USE_EMOJIS = True
-    ALLOW_RHETORICAL_QUESTIONS = True
-    
-    # Token management
     SUMMARY_MAX_TOKENS = 300
-    TRUNCATION_CHECK_PATTERN = r"[.!?]$"
-    SUMMARY_MIN_WORDS = 40
 
-class NarrativeEvaluator:
-    """Base evaluator with shared methods"""
+def format_for_dyslexia(text: str) -> str:
+    """Apply clean, dyslexia-friendly formatting"""
+    if not text:
+        return text
+        
+    # Clean up text
+    text = re.sub(r'\*\*|\*', '', text)  # Remove bold formatting
+    text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+    text = re.sub(r'\s([.,!?])', r'\1', text)  # Fix punctuation spacing
     
-    def __init__(self):
-        try:
-            from rouge_score import rouge_scorer
-            self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-        except ImportError:
-            self.rouge_scorer = None
-        
-        # Coherence indicators
-        self.causal_words = {'because', 'since', 'so', 'therefore', 'thus', 'as a result'}
-        self.temporal_words = {'first', 'then', 'next', 'after', 'before', 'finally', 'now'}
-        self.contrast_words = {'but', 'however', 'although', 'despite', 'actually', 'in reality'}
-        self.question_words = {'who', 'what', 'where', 'when', 'why', 'how', '?'}
-        
-        self.narrative_connectors = self.causal_words | self.temporal_words | self.contrast_words
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    formatted = []
     
-    @staticmethod
-    def split_sentences(text: str) -> list[str]:
-        """Lightweight sentence splitting"""
-        if not text or not text.strip():
-            return []
-        parts = [s.strip() for s in re.split(r'[.!?]+\s+', text) if s.strip()]
-        return parts if parts else [text.strip()]
+    for i, sentence in enumerate(sentences):
+        # Clean and capitalize
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        sentence = sentence[0].upper() + sentence[1:]
+            
+        # Break long sentences
+        words = sentence.split()
+        if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
+            # Split at natural breaking point
+            for break_word in ['but', 'and', 'so', 'because']:
+                if break_word in words[3:-3]:
+                    idx = words.index(break_word)
+                    sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
+                    break
+        
+        formatted.append(sentence)
+        
+        # Add paragraph breaks
+        if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
+            formatted.append("")  # Empty line
     
-    def calculate_readability(self, text: str) -> dict[str, float]:
-        """Calculate readability metrics"""
-        if not text or not text.strip():
-            return {
-                'flesch_reading_ease': 0.0,
-                'avg_sentence_length': 0.0,
-                'syllable_density': 0.0,
-                'short_word_ratio': 0.0,
-                'total_words': 0,
-                'total_sentences': 0,
-            }
-        
-        words = text.split()
-        sentences = self.split_sentences(text)
-        total_words = len(words)
-        total_sentences = max(1, len(sentences))
-        
-        # Simple syllable counting
-        syllables = sum(self._count_word_syllables(word) for word in words)
-        
-        # Calculate FRE
-        if total_words == 0:
-            fre = 0.0
-        else:
-            avg_sentence_length = total_words / total_sentences
-            avg_syllables_per_word = syllables / total_words
-            fre = 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
-        
-        avg_sentence_length = total_words / total_sentences
-        syllable_density = syllables / total_words if total_words > 0 else 0.0
-        
-        # Count short words
-        short_words = sum(1 for word in words if self._count_word_syllables(word) <= 2)
-        short_word_ratio = short_words / total_words if total_words > 0 else 0.0
-        
-        return {
-            'flesch_reading_ease': fre,
-            'avg_sentence_length': avg_sentence_length,
-            'syllable_density': syllable_density,
-            'short_word_ratio': short_word_ratio,
-            'total_words': total_words,
-            'total_sentences': total_sentences,
-        }
-    
-    def _count_word_syllables(self, word: str) -> int:
-        """Count syllables in a word"""
-        word = word.lower().strip()
-        if not word:
-            return 0
-        
-        vowels = 'aeiouy'
-        syllable_count = 0
-        prev_was_vowel = False
-        
-        for char in word:
-            if char in vowels:
-                if not prev_was_vowel:
-                    syllable_count += 1
-                prev_was_vowel = True
-            else:
-                prev_was_vowel = False
-        
-        if word.endswith('e') and syllable_count > 1:
-            syllable_count -= 1
-        
-        return max(1, syllable_count)
-    
-    def calculate_rouge_l(self, summary: str, original: str) -> float:
-        """Calculate ROUGE-L score"""
-        if not self.rouge_scorer or not summary or not original:
-            return 0.0
-        try:
-            score = self.rouge_scorer.score(original, summary)
-            return score["rougeL"].fmeasure
-        except:
-            return 0.0
+    return "\n".join(formatted)
 
-class DyslexiaFriendlyEvaluator(NarrativeEvaluator):
-    """Evaluator with enhanced dyslexia support"""
+def create_summary_prompt(text: str) -> str:
+    """Create optimized prompt for cohesive summaries"""
+    return f"""
+    Create a concise, easy-to-read summary for dyslexic readers. Follow these rules:
     
-    def __init__(self):
-        super().__init__()
-        # Reduced cognitive load features
-        self.sentence_break_words = ['but', 'and', 'so', 'because', 'however', 'therefore']
+    1. Use VERY short sentences (4-8 words)
+    2. Use simple words (1-2 syllables)
+    3. Maintain narrative flow between sentences
+    4. Keep the main idea clear
+    5. End with a key takeaway
+    6. Use proper names consistently
     
-    def format_for_dyslexia(self, text: str) -> str:
-        """Apply enhanced dyslexia-friendly formatting"""
-        if not text:
-            return text
-            
-        # Step 1: Clean up formatting issues
-        text = re.sub(r'\*\*|\*', '', text)  # Remove bold formatting
-        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
-        text = re.sub(r'\s([.,!?])', r'\1', text)  # Fix punctuation spacing
-        text = re.sub(r'\.{2,}', '.', text)  # Remove excessive periods
-        
-        # Step 2: Split into sentences
-        sentences = self.split_sentences(text)
-        formatted = []
-        
-        for i, sentence in enumerate(sentences):
-            # Clean sentence
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-                
-            # Break long sentences at natural points
-            words = sentence.split()
-            if len(words) > DyslexiaFriendlyConfig.MAX_SENTENCE_LENGTH:
-                for break_word in self.sentence_break_words:
-                    if break_word in words[3:-3]:
-                        idx = words.index(break_word)
-                        sentence = " ".join(words[:idx+1]) + ". " + " ".join(words[idx+1:])
-                        break
-            
-            # Capitalize first word only
-            if sentence:
-                sentence = sentence[0].upper() + sentence[1:]
-                
-            formatted.append(sentence)
-            
-            # Add paragraph breaks
-            if (i + 1) % DyslexiaFriendlyConfig.MAX_PARAGRAPH_LENGTH == 0:
-                formatted.append("")  # Empty line for paragraph break
-        
-        # Step 3: Structure with clear section breaks
-        return "\n".join(formatted)
-
-    def calculate_narrative_coherence(self, text: str) -> dict[str, float]:
-        """Calculate narrative coherence metrics"""
-        if not text:
-            return {
-                'coherence_score': 0.0,
-                'causal_connections': 0,
-                'temporal_markers': 0,
-                'contrast_markers': 0,
-                'question_count': 0,
-                'sentence_flow_score': 0.0
-            }
-        
-        text_lower = text.lower()
-        words = text_lower.split()
-        
-        # Count connectors
-        causal_count = sum(1 for word in self.causal_words if word in text_lower)
-        temporal_count = sum(1 for word in self.temporal_words if word in text_lower)
-        contrast_count = sum(1 for word in self.contrast_words if word in text_lower)
-        question_count = sum(1 for word in self.question_words if word in text_lower)
-        
-        # Calculate scores
-        connector_score = min(50, (causal_count * 10) + (temporal_count * 8) + (contrast_count * 6))
-        question_score = min(30, question_count * 15)
-        flow_score = self._calculate_sentence_flow(self.split_sentences(text))
-        
-        return {
-            'coherence_score': min(100, connector_score + question_score + (flow_score * 20)),
-            'causal_connections': causal_count,
-            'temporal_markers': temporal_count,
-            'contrast_markers': contrast_count,
-            'question_count': question_count,
-            'sentence_flow_score': flow_score
-        }
+    Structure:
+    - Start with what happened
+    - Explain why it matters
+    - End with what might happen next
     
-    def _calculate_sentence_flow(self, sentences: list[str]) -> float:
-        """Calculate how well sentences flow together"""
-        if len(sentences) < 2:
-            return 0.0
-        
-        flow_score = 0.0
-        for i in range(len(sentences) - 1):
-            current = sentences[i].lower().strip()
-            next_sent = sentences[i + 1].lower().strip()
-            
-            # Check for pronouns referring to previous sentence subjects
-            if any(word in next_sent.split()[:3] for word in ['he', 'she', 'it', 'they', 'this', 'that']):
-                flow_score += 0.5
-            
-            # Check for topic continuity (shared keywords)
-            current_words = set(current.split())
-            next_words = set(next_sent.split()[:5])  # First few words of next sentence
-            if current_words & next_words:
-                flow_score += 0.3
-        
-        return min(1.0, flow_score / (len(sentences) - 1))
-
-    def calculate_engagement_score(self, text: str) -> float:
-        """Calculate how engaging the summary is"""
-        if not text:
-            return 0.0
-            
-        score = 0
-        text_lower = text.lower()
-        
-        # Questions boost engagement
-        if any(q in text_lower for q in self.question_words):
-            score += 30
-        
-        # Personal pronouns create connection
-        if re.search(r"\b(I|you|we|us|our)\b", text):
-            score += 15
-            
-        # Action verbs
-        action_verbs = re.findall(r"\b(is|are|was|were|has|have|do|does|did|will|can|should)\b", text_lower)
-        score += min(20, len(action_verbs) * 2)
-        
-        return min(100, score)
-
-def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
-    """Create dyslexia-friendly prompts without emojis"""
-    base_instructions = [
-        # Attempt 0: Simple structured format
-        (
-            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
-            "- Keep sentences 4–8 words\n"
-            "- Prefer one-syllable words\n"
-            "- Simple present tense\n"
-            "- Keep key facts\n\n"
-            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
-            "- Don't give bullet points"
-            
-        ),
-        # Attempt 1: Problem/Solution format
-        (
-            "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
-            "- Keep sentences 4–8 words\n"
-            "- Prefer one-syllable words\n"
-            "- Simple present tense\n"
-            "- Keep key facts\n\n"
-            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
-            "- Don't give bullet points"
-            
-        ),
-        # Attempt 2: Timeline format
-        (
-          "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
-            "- Keep sentences 4–8 words\n"
-            "- Prefer one-syllable words\n"
-            "- Simple present tense\n"
-            "- Keep key facts\n\n"
-            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
-            "- Don't give bullet points"
-           
-        )
-    ]
+    Article: {text[:2000]}
     
-    instruction = base_instructions[min(attempt, len(base_instructions) - 1)]
-    return f"{instruction}Article: {text[:1500]}\n\nStructured summary:"
+    Clear summary:
+    """
 
 @app.route("/api/summarize", methods=["GET", "POST", "OPTIONS"])
 @jwt_required(optional=True)
@@ -1077,150 +837,44 @@ def summarize():
                     "upgrade_url": f"{FRONTEND_URL}/upgrade"
                 }), 402
         
-        # Initialize evaluator and config
-        evaluator = DyslexiaFriendlyEvaluator()
-        config = DyslexiaFriendlyConfig()
+        # Generate summary
+        prompt = create_summary_prompt(input_text)
         
-        # Controller loop
-        best_summary = None
-        best_score = -float('inf')
-        target_hit = False
-        best_readability = None
-        best_coherence = None
-        best_rouge = None
-        best_engagement = None
-        attempts_used = 0
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=DyslexiaFriendlyConfig.SUMMARY_MAX_TOKENS
+        )
         
-        for attempt in range(config.CONTROLLER_MAX_TRIES):
-            attempts_used = attempt + 1
-            try:
-                prompt = create_dyslexia_prompt(input_text, attempt)
-                
-                # Generate summary
-                resp = openai.ChatCompletion.create(
-                    model="gpt-4o",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.8,
-                    max_tokens=config.SUMMARY_MAX_TOKENS
-                )
-                
-                raw_summary = (resp.choices[0].message.content or "").strip()
-                if not raw_summary:
-                    continue
-                
-                # Apply dyslexia formatting
-                formatted_summary = evaluator.format_for_dyslexia(raw_summary)
-                
-                # Skip summaries that are too short
-                word_count = len(formatted_summary.split())
-                if word_count < config.SUMMARY_MIN_WORDS:
-                    continue
-                
-                # Evaluate the summary
-                readability = evaluator.calculate_readability(formatted_summary)
-                coherence = evaluator.calculate_narrative_coherence(formatted_summary)
-                rouge_l = evaluator.calculate_rouge_l(formatted_summary, input_text)
-                engagement = evaluator.calculate_engagement_score(formatted_summary)
-                
-                # Check if summary meets all targets
-                if (
-                    readability['flesch_reading_ease'] >= config.TARGET_FRE_MIN and
-                    readability['avg_sentence_length'] <= config.TARGET_AVG_SENTLEN_MAX and
-                    rouge_l >= config.MIN_ROUGE_L and
-                    coherence['causal_connections'] >= config.MIN_CAUSAL_CONNECTIONS
-                ):
-                    target_hit = True
-                    best_summary = formatted_summary
-                    best_readability = readability
-                    best_coherence = coherence
-                    best_rouge = rouge_l
-                    best_engagement = engagement
-                    break  # Exit early since we found a good summary
-                
-                # Calculate overall quality score
-                balance_score = (
-                    config.BALANCE_W_READABILITY * readability['flesch_reading_ease'] +
-                    config.BALANCE_W_SEMANTICS * (rouge_l * 100) +
-                    config.BALANCE_W_COHERENCE * coherence['coherence_score'] +
-                    engagement * 0.1  # Include engagement in scoring
-                )
-                
-                # Update best summary if current is better
-                if balance_score > best_score:
-                    best_score = balance_score
-                    best_summary = formatted_summary
-                    best_readability = readability
-                    best_coherence = coherence
-                    best_rouge = rouge_l
-                    best_engagement = engagement
-                
-                # Add delay between attempts
-                time.sleep(config.REQUEST_DELAY)
-                    
-            except Exception as e:
-                logging.error(f"Summary attempt {attempt+1} failed: {str(e)}")
-                if attempt == config.CONTROLLER_MAX_TRIES - 1:
-                    break
+        raw_summary = (resp.choices[0].message.content or "").strip()
+        formatted_summary = format_for_dyslexia(raw_summary)
         
-        # Fallback if no summary was generated
-        if not best_summary:
-            logging.warning("All summary attempts failed, using fallback")
-            fallback_prompt = f"Create a simple 2-sentence summary: {input_text[:2000]}"
-            resp = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": fallback_prompt}],
-                max_tokens=200
-            )
-            best_summary = (resp.choices[0].message.content or "").strip()
-            best_engagement = 50  # Default engagement score
-            best_readability = evaluator.calculate_readability(best_summary)
-            best_coherence = evaluator.calculate_narrative_coherence(best_summary)
-            best_rouge = evaluator.calculate_rouge_l(best_summary, input_text)
+        # Ensure proper ending
+        if not re.search(r'[.!?]$', formatted_summary):
+            formatted_summary = re.sub(r'\W*$', '.', formatted_summary)
         
         # Update user request count
         if user_id:
             increment_user_requests(int(user_id))
-            log_usage(int(user_id), "summarize", {
-                "text_length": len(input_text),
-                "target_hit": target_hit,
-                "attempts_used": attempts_used,
-                "coherence_score": best_coherence.get('coherence_score', 0)
-            })
+            log_usage(int(user_id), "summarize", {"text_length": len(input_text)})
         
         # Calculate remaining requests
         remaining = None
         if user_id and user:
             remaining = max(0, user["request_limit"] - user["requests_used"] - 1)
         
-        # Build response
-        response_data = {
-            "summary_text": best_summary,
-            "engagement_score": round(best_engagement, 1) if best_engagement is not None else 50,
-            "readability": {
-                "score": round(best_readability['flesch_reading_ease'], 1),
-                "avg_sentence_length": round(best_readability['avg_sentence_length'], 1),
-            } if best_readability else {"score": 0, "avg_sentence_length": 0},
-            "semantic_quality": round(best_rouge * 100, 1) if best_rouge is not None else 0,
-            "coherence": {
-                "score": round(best_coherence.get('coherence_score', 0), 1),
-                "questions": best_coherence.get('question_count', 0),
-            },
-            "dyslexia_friendly": True,
+        return jsonify({
+            "summary_text": formatted_summary,
             "requests_remaining": remaining,
-            "formatting_tips": [
-                f"Short sentences (avg {round(best_readability['avg_sentence_length'], 1) if best_readability else 0} words)",
-                "Emojis used: " + ("✅" if re.search(r"[\U0001F000-\U0001FAFF]", best_summary) else "❌"),
-                f"Engagement: {round(best_engagement, 1) if best_engagement else 50}/100"
-            ]
-        }
-        
-        return jsonify(response_data), 200
+            "dyslexia_friendly": True
+        }), 200
         
     except Exception as e:
-        logging.error(f"Summarization error: {str(e)}")
+        logging.error(f"Summarization error: {e}")
         logging.error(traceback.format_exc())
-        return jsonify({"error": "Internal server error"}), 500
-    
+        return jsonify({"error": "Summary generation failed"}), 500
+
 @app.post("/api/synthesize")
 @jwt_required()
 def synthesize():
@@ -1232,76 +886,38 @@ def synthesize():
         if not text:
             return jsonify({"error": "No text provided"}), 400
 
-        if not ELEVENLABS_AVAILABLE:
-            return jsonify({"error": "Voice service not available"}), 503
-            
         if not ELEVENLABS_API_KEY:
             return jsonify({"error": "Voice service not configured"}), 500
 
-        VOICES = {
-            "clear_narrator": "21m00Tcm4TlvDq8ikWAM",  # Rachel - clear, neutral delivery
-            "calm_male": "AZnzlk1XvdvUeBnXmlld",     # Dominic - calm, authoritative
-            "warm_female": "EXAVITQu4vr4xnSDxMaL"    # Sarah - warm, engaging
-        }
-        DEFAULT_VOICE = "clear_narrator"
+        VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel - clear, neutral delivery
         MAX_TEXT_LENGTH = 1000
+        ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
         if len(text) > MAX_TEXT_LENGTH:
             text = text[:MAX_TEXT_LENGTH]
 
-        # Preprocess text for better TTS delivery
-        def optimize_for_tts(content):
-            # Add strategic pauses for natural rhythm
-            content = re.sub(r'([.!?])', r'\1 ', content)  # Space after punctuation
-            content = re.sub(r'\s+', ' ', content)  # Normalize whitespace
-            
-            # Add pauses between sections
-            content = re.sub(r'\n\n+', '<break time="800ms"/>', content)
-            content = re.sub(r'\n', '<break time="500ms"/>', content)
-            
-            # Add pauses for commas
-            content = re.sub(r',', ',<break time="200ms"/>', content)
-            
-            # Emphasize key phrases
-            key_phrases = re.findall(r'\b(important|warning|note:|however|but|critical)\b', content, re.IGNORECASE)
-            for phrase in set(key_phrases):
-                content = content.replace(phrase, f'<emphasis level="strong">{phrase}</emphasis>')
-            
-            # Slow down numbers and complex terms
-            content = re.sub(r'(\d+[.,]\d+)', r'<prosody rate="slow">\1</prosody>', content)
-            
-            return f'<speak>{content}</speak>'
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY
+        }
+
+        data = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",  # More reliable model
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
 
         try:
-            # Preprocess text for better delivery
-            optimized_text = optimize_for_tts(text)
+            response = requests.post(ELEVENLABS_URL, json=data, headers=headers, timeout=10)
+            response.raise_for_status()
             
-            # Try new SDK pattern first
-            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+            audio_bytes = response.content
             
-            # Voice settings tuned for clear, natural delivery
-            voice_settings = VoiceSettings(
-                stability=0.35,        # Lower = more expressive (range: 0-1)
-                similarity_boost=0.85,  # Higher = more consistent voice (range: 0-1)
-                style=0.4,              # Moderate expressiveness (range: 0-1)
-                use_speaker_boost=True
-            )
-            
-            stream = client.text_to_speech.convert(
-                text=optimized_text,
-                voice_id=VOICES[DEFAULT_VOICE],
-                model_id="eleven_english_sts_v2",  # More natural model
-                output_format="mp3_44100_128",
-                voice_settings=voice_settings
-            )
-            
-            audio_bytes = b"".join(stream)
-            
-            log_usage(int(user_id), "tts", {
-                "text_length": len(text),
-                "voice": DEFAULT_VOICE,
-                "optimized": True
-            })
+            log_usage(int(user_id), "tts", {"text_length": len(text)})
             
             return send_file(
                 io.BytesIO(audio_bytes),
@@ -1311,39 +927,12 @@ def synthesize():
             )
             
         except Exception as e:
-            logger.error(f"TTS primary error: {e}")
-            # Fallback to simpler generation without SSML
-            try:
-                client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-                stream = client.text_to_speech.convert(
-                    text=text,  # Use original text without SSML
-                    voice_id=VOICES[DEFAULT_VOICE],
-                    model_id="eleven_monolingual_v1",
-                    output_format="mp3_44100_128",
-                    voice_settings=VoiceSettings(
-                        stability=0.5,
-                        similarity_boost=0.75,
-                        style=0.3,
-                        use_speaker_boost=True
-                    )
-                )
-                audio_bytes = b"".join(stream)
-                
-                log_usage(int(user_id), "tts_fallback", {"text_length": len(text)})
-                return send_file(
-                    io.BytesIO(audio_bytes),
-                    mimetype="audio/mpeg",
-                    as_attachment=False,
-                    download_name="lexismart_audio.mp3"
-                )
-                
-            except Exception as fallback_e:
-                logger.error(f"TTS fallback error: {fallback_e}")
-                return jsonify({"error": "Voice generation failed"}), 500
+            logger.error(f"TTS API error: {e}")
+            return jsonify({"error": "Voice generation failed. Please try again."}), 500
 
     except Exception as e:
         logger.error(f"TTS system error: {e}")
-        return jsonify({"error": "Voice generation failed"}), 500
+        return jsonify({"error": "Voice service unavailable"}), 500
     
 # Mind Map Storage
 @app.post("/api/save-mindmap")
