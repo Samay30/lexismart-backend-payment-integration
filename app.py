@@ -1012,7 +1012,8 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
             "- Prefer one-syllable words\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
-            "- Make sure sentences are cohesive and there is a narrative flow"
+            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
+            "- Don't give bullet points"
             
         ),
         # Attempt 1: Problem/Solution format
@@ -1022,17 +1023,19 @@ def create_dyslexia_prompt(text: str, attempt: int = 0) -> str:
             "- Prefer one-syllable words\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
-            "- Make sure sentences are cohesive and there is a narrative flow"
+            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
+            "- Don't give bullet points"
             
         ),
         # Attempt 2: Timeline format
         (
-           "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
+          "Write a very easy-to-read summary for dyslexic readers. Prioritize clarity over style.\n"
             "- Keep sentences 4–8 words\n"
             "- Prefer one-syllable words\n"
             "- Simple present tense\n"
             "- Keep key facts\n\n"
-            "- Make sure sentences are cohesive and there is a narrative flow"
+            "- Make there is a narrative flow between sentences and all the sentences convey the main idea of the input article"
+            "- Don't give bullet points"
            
         )
     ]
